@@ -63,6 +63,9 @@ class AzureNodeProvider(NodeProvider):
     immediately to terminated when ``terminate_node`` is called.
     """
 
+    # Class-level variable to store cluster config
+    cluster_config = None
+
     def __init__(self, provider_config, cluster_name):
         NodeProvider.__init__(self, provider_config, cluster_name)
         subscription_id = provider_config["subscription_id"]
@@ -252,6 +255,7 @@ class AzureNodeProvider(NodeProvider):
 
     def _create_node(self, node_config, tags, count):
         """Creates a number of nodes within the namespace."""
+
         resource_group = self.provider_config["resource_group"]
 
         # load the template file
@@ -286,6 +290,36 @@ class AzureNodeProvider(NodeProvider):
         template_params["msi"] = self.provider_config["msi"]
         template_params["nsg"] = self.provider_config["nsg"]
         template_params["subnet"] = self.provider_config["subnet"]
+
+        # The cloud-init script to be run on the node for initial setup.
+        # If a docker image is specified in the cluster config, this script
+        # will also ensure docker is running and that the ssh_user is
+        # added to the docker group.
+        tags.update(config_tags)
+
+        ssh_user = self.provider_config.get("auth", {}).get("ssh_user", "ubuntu")
+        runcmd = [
+            f"touch /home/{ssh_user}/.sudo_as_admin_successful",
+        ]
+
+        if AzureNodeProvider.cluster_config and AzureNodeProvider.cluster_config.get(
+            "docker", {}
+        ).get("image"):
+            docker_commands = [
+                "systemctl enable docker || true",
+                "systemctl start docker || true",
+                f"usermod -aG docker {ssh_user}",
+            ]
+            runcmd.extend(docker_commands)
+
+        custom_data = {
+            "write_files": [],
+            "runcmd": runcmd,
+        }
+
+        import yaml
+
+        template_params["customData"] = "#cloud-config\n" + yaml.dump(custom_data)
 
         parameters = {
             "properties": {
@@ -489,4 +523,9 @@ class AzureNodeProvider(NodeProvider):
 
     @staticmethod
     def bootstrap_config(cluster_config):
-        return bootstrap_azure(cluster_config)
+        bootstrapped_config = bootstrap_azure(cluster_config)
+
+        # Store the bootstrapped config for later use.
+        AzureNodeProvider.cluster_config = bootstrapped_config
+
+        return bootstrapped_config

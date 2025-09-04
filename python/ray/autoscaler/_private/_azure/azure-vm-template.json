@@ -20,6 +20,13 @@
                 "description": "SSH Key for the Virtual Machine"
             }
         },
+        "customData": {
+            "type": "string",
+            "defaultValue": "",
+            "metadata": {
+                "description": "Custom data to pass to the VM (cloud-init config)"
+            }
+        },
         "imagePublisher": {
             "type": "string",
             "metadata": {
@@ -263,6 +270,7 @@
                     "computerName": "[concat(parameters('vmName'), copyIndex())]",
                     "adminUsername": "[parameters('adminUsername')]",
                     "adminPassword": "[parameters('publicKey')]",
+                    "customData": "[if(equals(parameters('customData'), ''), json('null'), base64(parameters('customData')))]",
                     "linuxConfiguration": {
                         "disablePasswordAuthentication": true,
                         "ssh": {
