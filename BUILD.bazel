@@ -92,6 +92,7 @@ alias(
     actual = select({
         "//bazel:linux_x86_64_config": "@uv_x86_64-linux//:file",
         "//bazel:osx_arm64_config": "@uv_aarch64-darwin//:file",
+        "//bazel:windows_arm64_config": "@uv_aarch64-windows//:file",
         "//conditions:default": "@uv_x86_64-linux//:file",
     }),
 )

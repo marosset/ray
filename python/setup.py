@@ -51,6 +51,24 @@ exe_suffix = ".exe" if sys.platform == "win32" else ""
 # https://docs.python.org/3/faq/windows.html#is-a-pyd-file-the-same-as-a-dll
 pyd_suffix = ".pyd" if sys.platform == "win32" else ".so"
 
+# Platform and architecture detection for wheel tagging
+def get_platform_tag():
+    """Get the platform tag for wheel naming."""
+    import platform
+
+    if sys.platform == "win32":
+        arch = platform.machine().lower()
+        if arch in ("arm64", "aarch64"):
+            return "win_arm64"
+        elif arch in ("amd64", "x86_64"):
+            return "win_amd64"
+        elif arch in ("x86", "i386", "i686"):
+            return "win32"
+        else:
+            # Fallback to win_amd64 for unknown architectures
+            return "win_amd64"
+    return None
+
 
 def find_version(*filepath):
     # Extract version information from filepath
@@ -752,6 +770,13 @@ if __name__ == "__main__":
     class BinaryDistribution(setuptools.Distribution):
         def has_ext_modules(self):
             return True
+
+        def get_platform_name(self):
+            """Override platform name for Windows ARM64 support."""
+            platform_tag = get_platform_tag()
+            if platform_tag:
+                return platform_tag
+            return super().get_platform_name()
 
     # Ensure no remaining lib files.
     build_dir = os.path.join(ROOT_DIR, "build")

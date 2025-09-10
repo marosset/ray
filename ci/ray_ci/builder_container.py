@@ -15,6 +15,7 @@ BUILD_TYPES = [
 ARCHITECTURE = [
     "x86_64",
     "aarch64",
+    "arm64",
 ]
 PYTHON_VERSIONS = {
     "3.9": PythonVersionInfo(bin_path="cp39-cp39"),

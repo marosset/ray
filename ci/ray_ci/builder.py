@@ -133,7 +133,7 @@ def build_wheel(
     Build a wheel artifact.
     """
     if operating_system == "windows":
-        return WindowsBuilderContainer(python_version, upload).run()
+        return WindowsBuilderContainer(python_version, upload, architecture).run()
     return BuilderContainer(python_version, build_type, architecture, upload).run()
 
 
