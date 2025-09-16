@@ -1,0 +1,14 @@
+load("@rules_python//python:defs.bzl", "py_library")
+
+py_library(
+    name = "_private_lib",
+    srcs = glob(["*.py"]),
+    visibility = [
+        "//python/ray/autoscaler:__subpackages__",
+        "//python/ray/autoscaler/_private:__subpackages__",
+        "//python/ray/tests:__subpackages__",
+    ],
+    deps = [
+        "//:ray_lib",
+    ],
+)

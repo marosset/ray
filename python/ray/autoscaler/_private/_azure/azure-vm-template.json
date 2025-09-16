@@ -25,36 +25,36 @@
             "metadata": {
                 "description": "The publisher of the VM image"
             },
-	    "defaultValue": ""
+            "defaultValue": ""
         },
         "imageOffer": {
             "type": "string",
             "metadata": {
                 "description": "The offer of the VM image"
             },
-	    "defaultValue": ""
+            "defaultValue": ""
         },
         "imageSku": {
             "type": "string",
             "metadata": {
                 "description": "The sku of the VM image"
             },
-	    "defaultValue": ""
+            "defaultValue": ""
         },
         "imageVersion": {
             "type": "string",
             "metadata": {
                 "description": "The version of the VM image"
             },
-	    "defaultValue": ""
+            "defaultValue": ""
         },
-	"imageId": {
-	    "type": "string",
-	    "metadata": {
-		"description": "The resource id of the VM image. If provided, it will override the imagePublisher, imageOffer, imageSku and imageVersion parameters."
-	    },
-	    "defaultValue": ""
-	},
+        "imageId": {
+            "type": "string",
+            "metadata": {
+                "description": "The resource id of the VM image. If provided, it will override the imagePublisher, imageOffer, imageSku and imageVersion parameters."
+            },
+            "defaultValue": ""
+        },
         "vmSize": {
             "type": "string",
             "metadata": {
@@ -73,13 +73,13 @@
                 "description": "Number of VMs to deploy"
             }
         },
-	"osDiskSize": {
-	    "type": "int",
-	    "defaultValue": 0,
-	    "metadata": {
-		"description": "Size of the OS disk in GB"
-	    }
-	},
+        "osDiskSize": {
+            "type": "int",
+            "defaultValue": 0,
+            "metadata": {
+                "description": "Size of the OS disk in GB"
+            }
+        },
         "provisionPublicIp": {
             "type": "bool",
             "defaultValue": true,
@@ -131,6 +131,13 @@
             "defaultValue": false,
             "metadata": {
                 "descriptions": "Whether to enable accelerated networking."
+            }
+        },
+        "customData": {
+            "type": "string",
+            "defaultValue": "",
+            "metadata": {
+                "description": "Base64-encoded cloud-init custom data script."
             }
         }
     },
@@ -245,7 +252,7 @@
                 "storageProfile": {
                     "osDisk": {
                         "createOption": "fromImage",
-			"diskSizeGB": "[if(equals(parameters('osDiskSize'), 0), json('null'), parameters('osDiskSize'))]",
+                        "diskSizeGB": "[if(equals(parameters('osDiskSize'), 0), json('null'), parameters('osDiskSize'))]",
                         "managedDisk": {
                             "storageAccountType": "[variables('osDiskType')]"
                         }
@@ -263,6 +270,7 @@
                     "computerName": "[concat(parameters('vmName'), copyIndex())]",
                     "adminUsername": "[parameters('adminUsername')]",
                     "adminPassword": "[parameters('publicKey')]",
+                    "customData": "[if(equals(parameters('customData'), ''), json('null'), parameters('customData'))]",
                     "linuxConfiguration": {
                         "disablePasswordAuthentication": true,
                         "ssh": {
@@ -282,8 +290,7 @@
             "identity": {
                 "type": "UserAssigned",
                 "userAssignedIdentities": {
-                    "[parameters('msi')]": {
-                    }
+                    "[parameters('msi')]": {}
                 }
             }
         }

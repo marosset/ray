@@ -61,6 +61,8 @@ available_node_types:
                 imageOffer: ubuntu-1804
                 imageSku: 1804-gen2
                 imageVersion: latest
+                # Optional: specify OS disk size in GB (will auto-expand filesystem)
+                # osDiskSize: 100
 
     ray.worker.default:
         # The minimum number of nodes of this type to launch.
@@ -77,6 +79,8 @@ available_node_types:
                 imageOffer: ubuntu-1804
                 imageSku: 1804-gen2
                 imageVersion: latest
+                # Optional: specify OS disk size in GB (will auto-expand filesystem)
+                # osDiskSize: 50
                 # comment lines below to not use Spot instances
                 priority: Spot
                 # set a maximum price for spot instances if desired

@@ -1,0 +1,33 @@
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
+
+py_library(
+    name = "_azure",
+    srcs = glob(
+        ["*.py"],
+        exclude = ["test_*.py"],
+    ),
+    data = glob(["*.json"]),
+    visibility = [
+        "//python/ray/autoscaler/_private:__subpackages__",
+        "//python/ray/autoscaler/_private/_azure/tests:__subpackages__",
+    ],
+    deps = [
+        "//python/ray/autoscaler/_private:_private_lib",
+    ],
+)
+
+py_test(
+    name = "test_cloud_init",
+    size = "small",
+    srcs = ["test_cloud_init.py"],
+    data = glob(["*.json"]),
+    tags = [
+        "exclusive",
+        "small_size_python_tests",
+        "team:core",
+    ],
+    deps = [
+        ":_azure",
+        "//:ray_lib",
+    ],
+)

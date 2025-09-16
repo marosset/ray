@@ -287,6 +287,9 @@ class AzureNodeProvider(NodeProvider):
         template_params["nsg"] = self.provider_config["nsg"]
         template_params["subnet"] = self.provider_config["subnet"]
 
+        # Add cloud-init script for disk expansion if osDiskSize is specified
+        template_params["customData"] = self._generate_cloud_init_data(template_params)
+
         parameters = {
             "properties": {
                 "mode": DeploymentMode.incremental,
@@ -306,6 +309,20 @@ class AzureNodeProvider(NodeProvider):
             deployment_name=vm_name,
             parameters=parameters,
         ).wait(timeout=AUTOSCALER_NODE_START_WAIT_S)
+
+    def _generate_cloud_init_data(self, template_params):
+        """Generate base64-encoded cloud-init data for disk expansion if needed.
+
+        Delegates to the pure-Python helper in cloud_init.py so tests can import
+        and validate the generation logic without pulling in Azure SDKs or
+        Ray native extensions.
+        """
+        # Local import to avoid top-level import cycles.
+        from ray.autoscaler._private._azure.cloud_init import (
+            generate_cloud_init_data,
+        )
+
+        return generate_cloud_init_data(template_params)
 
     @synchronized
     def set_node_tags(self, node_id, tags):
