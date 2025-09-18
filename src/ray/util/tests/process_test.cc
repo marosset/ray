@@ -21,7 +21,9 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "ray/util/logging.h"
