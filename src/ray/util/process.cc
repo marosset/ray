@@ -157,19 +157,22 @@ class ProcessFD {
     }
     bool succeeded = false;
     PROCESS_INFORMATION pi = {};
-    for (int attempt = 0; attempt < sizeof(cmds) / sizeof(*cmds); ++attempt) {
+    for (int attempt = 0; attempt < static_cast<int>(sizeof(cmds) / sizeof(*cmds));
+         ++attempt) {
       std::string &cmd = cmds[attempt];
-      if (!cmd.empty()) {
-        (void)cmd.c_str();  // We'll need this to be null-terminated (but mutable) below
-        TCHAR *cmdline = &*cmd.begin();
-        STARTUPINFO si = {sizeof(si)};
-        RAY_UNUSED(
-            new_env_block.c_str());  // Ensure there's a final terminator for Windows
-        char *const envp = &new_env_block[0];
-        if (CreateProcessA(NULL, cmdline, NULL, NULL, FALSE, 0, envp, NULL, &si, &pi)) {
-          succeeded = true;
-          break;
-        }
+      if (cmd.empty()) {
+        continue;
+      }
+      // Ensure mutable, null-terminated buffer (C++17 data() gives non-const char*).
+      char *cmdline = cmd.data();
+      STARTUPINFOA si;
+      memset(&si, 0, sizeof(si));
+      si.cb = sizeof(si);
+      RAY_UNUSED(new_env_block.c_str());  // ensure final null terminator
+      char *envp = new_env_block.empty() ? nullptr : new_env_block.data();
+      if (CreateProcessA(NULL, cmdline, NULL, NULL, FALSE, 0, envp, NULL, &si, &pi)) {
+        succeeded = true;
+        break;
       }
     }
     if (succeeded) {
@@ -369,23 +372,34 @@ Process::~Process() {}
 
 Process::Process() {}
 
-Process::Process(const Process &) = default;
+Process::Process(const Process &other)
+    : p_(other.p_),
+      exit_code_(other.exit_code_.load()),
+      exit_code_promise_(other.exit_code_promise_) {}
 
-Process::Process(Process &&) = default;
+Process::Process(Process &&other) noexcept
+    : p_(std::move(other.p_)),
+      exit_code_(other.exit_code_.load()),
+      exit_code_promise_(std::move(other.exit_code_promise_)) {}
 
 Process &Process::operator=(Process other) {
   p_ = std::move(other.p_);
+  exit_code_ = other.exit_code_.load();
+  exit_code_promise_ = std::move(other.exit_code_promise_);
   return *this;
 }
 
-Process::Process(pid_t pid) { p_ = std::make_shared<ProcessFD>(pid); }
+Process::Process(pid_t pid) : exit_code_promise_(nullptr) {
+  p_ = std::make_shared<ProcessFD>(pid);
+}
 
 Process::Process(const char *argv[],
                  void *io_service,
                  std::error_code &ec,
                  bool decouple,
                  const ProcessEnvironment &env,
-                 bool pipe_to_stdin) {
+                 bool pipe_to_stdin)
+    : exit_code_promise_(nullptr) {
   /// TODO: use io_service with boost asio notify_fork.
   (void)io_service;
 #ifdef __linux__
@@ -459,6 +473,14 @@ bool Process::IsNull() const { return !p_; }
 
 bool Process::IsValid() const { return GetId() != -1; }
 
+int Process::ExitCode() const { return exit_code_.load(std::memory_order_acquire); }
+
+std::future<int> Process::WaitAsync() {
+  // To be implemented in Step 1.4.
+  // For now, it returns an invalid future.
+  return std::future<int>();
+}
+
 std::pair<Process, std::error_code> Process::Spawn(const std::vector<std::string> &args,
                                                    bool decouple,
                                                    const std::string &pid_file,
@@ -480,10 +502,19 @@ std::pair<Process, std::error_code> Process::Spawn(const std::vector<std::string
 }
 
 int Process::Wait() const {
-  int status;
-  if (p_) {
+  int cached = exit_code_.load(std::memory_order_acquire);
+  if (cached != kStillRunning) {
+    return cached;  // already waited
+  }
+
+  int result = -1;
+  if (!p_) {
+    result = -1;  // null process
+  } else {
     pid_t pid = p_->GetId();
-    if (pid >= 0) {
+    if (pid < 0) {
+      result = 0;  // dummy process
+    } else {
       std::error_code error;
       intptr_t fd = p_->GetFD();
 #ifdef _WIN32
@@ -491,49 +522,53 @@ int Process::Wait() const {
       DWORD exit_code = STILL_ACTIVE;
       if (WaitForSingleObject(handle, INFINITE) == WAIT_OBJECT_0 &&
           GetExitCodeProcess(handle, &exit_code)) {
-        status = static_cast<int>(exit_code);
+        result = static_cast<int>(exit_code);
       } else {
         error = std::error_code(GetLastError(), std::system_category());
-        status = -1;
+        result = -1;
       }
 #else
-      // There are 3 possible cases:
-      // - The process is a child whose death we await via waitpid().
-      //   This is the usual case, when we have a child whose SIGCHLD we handle.
-      // - The process shares a pipe with us whose closure we use to detect its death.
-      //   This is used to track a non-owned process, like a grandchild.
-      // - The process has no relationship with us, in which case we simply fail,
-      //   since we have no need for this (and there's no good way to do it).
-      // Why don't we just poll the PID? Because it's better not to:
-      // - It would be prone to a race condition (we won't know when the PID is recycled).
-      // - It would incur high latency and/or high CPU usage for the caller.
       if (fd != -1) {
-        // We have a pipe, so wait for its other end to close, to detect process death.
-        unsigned char buf[1 << 8];
+        // Wait on pipe closure to detect death (grandchild tracking). Exit code unknown.
+        unsigned char buf[256];
         ptrdiff_t r;
         while ((r = read(fd, buf, sizeof(buf))) > 0) {
-          // Keep reading until socket terminates
         }
-        status = r == -1 ? -1 : 0;
-      } else if (waitpid(pid, &status, 0) == -1) {
-        // Just the normal waitpid() case.
-        // (We can only do this once, only if we own the process. It fails otherwise.)
-        error = std::error_code(errno, std::system_category());
+        result = (r == -1) ? -1 : 0;
+      } else {
+        int status = 0;
+        if (waitpid(pid, &status, 0) == -1) {
+          error = std::error_code(errno, std::system_category());
+          result = -1;
+        } else if (WIFEXITED(status)) {
+          result = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+          result = 128 + WTERMSIG(status);
+        } else {
+          result = -1;
+        }
       }
 #endif
       if (error) {
         RAY_LOG(ERROR) << "Failed to wait for process " << pid << " with error " << error
                        << ": " << error.message();
       }
-    } else {
-      // (Dummy process case)
-      status = 0;
     }
-  } else {
-    // (Null process case)
-    status = -1;
   }
-  return status;
+
+  // Attempt to publish result (single-writer expected). If another thread beat us,
+  // prefer the published value.
+  int expected = kStillRunning;
+  if (!exit_code_.compare_exchange_strong(expected, result, std::memory_order_acq_rel)) {
+    result = expected;  // someone else set it; use that value
+  } else if (exit_code_promise_) {
+    try {
+      exit_code_promise_->set_value(result);
+    } catch (...) {
+      // Ignore double-set or broken promise.
+    }
+  }
+  return result;
 }
 
 bool Process::IsAlive() const {
@@ -578,7 +613,10 @@ void Process::Kill() {
         // (Exception: Tests might occasionally trigger this, but that should be benign.)
       }
 #endif
-      if (error) {
+      if (!error) {
+        // Capture exit code after kill if possible.
+        Wait();
+      } else if (error) {
         RAY_LOG(DEBUG) << "Failed to kill process " << pid << " with error " << error
                        << ": " << error.message();
       }

@@ -20,8 +20,10 @@
 #include <unistd.h>
 #endif
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <optional>
@@ -40,6 +42,9 @@ enum { PID_MAX_LIMIT = 1 << 22 };
 #endif
 
 namespace ray {
+
+// A sentinel value indicating that the process has not yet terminated.
+constexpr int kStillRunning = -100;
 
 #if !defined(_WIN32)
 /// Sets the FD_CLOEXEC flag on a file descriptor.
@@ -68,6 +73,9 @@ class ProcessFD;
 class Process {
  protected:
   std::shared_ptr<ProcessFD> p_;
+  // Mutable so const Wait()/ExitCode() can update once the process terminates.
+  mutable std::atomic<int> exit_code_{kStillRunning};
+  std::shared_ptr<std::promise<int>> exit_code_promise_;
 
   explicit Process(pid_t pid);
 
@@ -76,7 +84,7 @@ class Process {
   /// Creates a null process object. Two null process objects are assumed equal.
   Process();
   Process(const Process &);
-  Process(Process &&);
+  Process(Process &&) noexcept;
   Process &operator=(Process other);
   /// Creates a new process.
   /// \param[in] argv The command-line of the process to spawn (terminated with NULL).
@@ -121,6 +129,14 @@ class Process {
   void Kill();
   /// Check whether the process is alive.
   bool IsAlive() const;
+  /// Gets the cached exit code of the process. If the process has not yet terminated
+  /// this returns kStillRunning. After the first successful Wait()/WaitAsync(), the
+  /// value is cached and subsequent calls return immediately.
+  /// \return The exit code, or kStillRunning while the process is still running.
+  int ExitCode() const;
+  /// Asynchronously waits for the process to terminate.
+  /// \return A future that will be fulfilled with the process's exit code.
+  std::future<int> WaitAsync();
   /// Convenience function to start a process in the background.
   /// \param pid_file A file to write the PID of the spawned process in.
   static std::pair<Process, std::error_code> Spawn(
@@ -128,8 +144,12 @@ class Process {
       bool decouple,
       const std::string &pid_file = std::string(),
       const ProcessEnvironment &env = {});
-  /// Waits for process to terminate. Not supported for unowned processes.
-  /// \return The process's exit code. Returns 0 for a dummy process, -1 for a null one.
+  /// Waits for process to terminate. On first completion, records the
+  /// normalized exit code (WEXITSTATUS / Windows GetExitCodeProcess). Subsequent calls
+  /// return the cached value immediately. Not supported for unowned processes that were
+  /// not spawned via this API (will return -1 if unable to obtain status).
+  /// \return The process's exit code. Returns 0 for a dummy process, -1 for a null one,
+  /// or -1 on unrecoverable wait error.
   int Wait() const;
 };
 
