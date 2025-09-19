@@ -135,13 +135,23 @@ class Process {
   /// value is cached and subsequent calls return immediately.
   /// \return The exit code, or kStillRunning while the process is still running.
   int ExitCode() const;
-  /// Asynchronously waits for the process to terminate.
-  /// Lazily spawns a single detached waiter thread (on first call while still running)
-  /// that invokes Wait() and publishes the normalized exit code via a shared_future.
-  /// If the process has already terminated when first invoked, returns an immediately
-  /// ready shared_future containing the cached exit code.
-  /// Thread-safe and idempotent: multiple callers receive the same shared_future.
-  /// \return A shared_future fulfilled with the process's exit code.
+  /// Asynchronously waits for process termination.
+  /// Creates exactly one detached waiter thread (first call while still running)
+  /// that invokes Wait() and fulfills a shared future with the normalized exit code.
+  /// If already terminated (cached, dummy, or null) returns an immediately ready
+  /// shared_future without spawning a thread.
+  /// Semantics:
+  ///   - Normal spawned processes: native exit / (128+signal) on POSIX, GetExitCodeProcess on Windows.
+  ///   - Dummy (pid < 0): exit 0 immediately.
+  ///   - Null (default constructed): exit -1 immediately.
+  ///   - FromPid() with no handle: resolves -1 (unknown) silently.
+  /// Thread-safety:
+  ///   - Mutex guards one-time promise/future init; atomic exit_code_ publishes result.
+  ///   - Multiple callers share the same std::shared_future<int>.
+  /// Reliability:
+  ///   - set_value guarded against double publish; no exceptions escape.
+  /// Caller must keep Process alive until future is ready; after that, copies are safe.
+  /// Returns a shared_future that is always eventually ready with an int result.
   std::shared_future<int> WaitAsync();
   /// Convenience function to start a process in the background.
   /// \param pid_file A file to write the PID of the spawned process in.
