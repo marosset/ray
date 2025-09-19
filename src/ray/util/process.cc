@@ -589,13 +589,21 @@ int Process::Wait() const {
       intptr_t fd = p_->GetFD();
 #ifdef _WIN32
       HANDLE handle = fd != -1 ? reinterpret_cast<HANDLE>(fd) : NULL;
-      DWORD exit_code = STILL_ACTIVE;
-      if (WaitForSingleObject(handle, INFINITE) == WAIT_OBJECT_0 &&
-          GetExitCodeProcess(handle, &exit_code)) {
-        result = static_cast<int>(exit_code);
-      } else {
-        error = std::error_code(GetLastError(), std::system_category());
+      if (handle == NULL) {
+        // No waitable process handle. This happens if the Process was created via
+        // FromPid() and OpenProcess() failed (e.g. process already exited or
+        // insufficient rights). Treat as unknown (-1) without logging a noisy
+        // ERROR_INVALID_HANDLE.
         result = -1;
+      } else {
+        DWORD exit_code = STILL_ACTIVE;
+        if (WaitForSingleObject(handle, INFINITE) == WAIT_OBJECT_0 &&
+            GetExitCodeProcess(handle, &exit_code)) {
+          result = static_cast<int>(exit_code);
+        } else {
+          error = std::error_code(GetLastError(), std::system_category());
+          result = -1;
+        }
       }
 #else
       if (fd != -1) {
