@@ -42,6 +42,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <thread>
 
 #include "ray/util/cmd_line_utils.h"
 #include "ray/util/filesystem.h"
@@ -369,8 +370,14 @@ intptr_t ProcessFD::GetFD() const { return fd_; }
 pid_t ProcessFD::GetId() const { return pid_; }
 
 Process::~Process() {}
-
-Process::Process() {}
+// Default constructed (null) process conceptually represents an already-invalid
+// handle; treat it as having a terminal exit code of -1 so async queries can be
+// satisfied immediately without spawning waiter threads.
+// NOTE: exit_code_ atomic default initializes to kStillRunning; we override here.
+// (We can't assign directly in the member declaration because we want the special
+// sentinel for spawned processes but immediate readiness for null/dummy.)
+// This relies on the compiler generating code after the atomic's default ctor.
+Process::Process() : exit_code_promise_(nullptr) { exit_code_.store(-1, std::memory_order_release); }
 
 Process::Process(const Process &other)
     : p_(other.p_),
@@ -391,6 +398,10 @@ Process &Process::operator=(Process other) {
 
 Process::Process(pid_t pid) : exit_code_promise_(nullptr) {
   p_ = std::make_shared<ProcessFD>(pid);
+  if (pid < 0) {
+    // Dummy process (placeholder) — treat as already successfully exited (0).
+    exit_code_.store(0, std::memory_order_release);
+  }
 }
 
 Process::Process(const char *argv[],
@@ -475,10 +486,59 @@ bool Process::IsValid() const { return GetId() != -1; }
 
 int Process::ExitCode() const { return exit_code_.load(std::memory_order_acquire); }
 
-std::future<int> Process::WaitAsync() {
-  // To be implemented in Step 1.4.
-  // For now, it returns an invalid future.
-  return std::future<int>();
+std::shared_future<int> Process::WaitAsync() {
+  // Fast path: previously created future.
+  {
+    std::lock_guard<std::mutex> lk(wait_async_mu_);
+    if (exit_code_future_.valid()) {
+      return exit_code_future_;
+    }
+  }
+
+  int cached = exit_code_.load(std::memory_order_acquire);
+  if (cached != kStillRunning) {
+    // Process already finished (Wait() or Kill() path) but no async waiter was ever
+    // requested. Materialize a ready future now.
+    std::promise<int> ready_promise;
+    ready_promise.set_value(cached);
+    auto fut = ready_promise.get_future().share();
+    std::lock_guard<std::mutex> lk(wait_async_mu_);
+    if (!exit_code_future_.valid()) {
+      exit_code_future_ = fut;
+    }
+    return exit_code_future_;
+  }
+
+  // Need to initialize async wait state exactly once.
+  std::shared_ptr<std::promise<int>> new_promise;
+  bool spawn_waiter = false;
+  {
+    std::lock_guard<std::mutex> lk(wait_async_mu_);
+    if (!exit_code_future_.valid()) {
+      new_promise = std::make_shared<std::promise<int>>();
+      exit_code_future_ = new_promise->get_future().share();
+      exit_code_promise_ = new_promise;  // consumed by Wait() completion path.
+      spawn_waiter = true;
+    }
+  }
+
+  if (spawn_waiter) {
+    // Launch detached waiter thread to perform blocking Wait() and fulfill promise.
+    // Assumption: caller retains Process object lifetime until future becomes ready.
+    std::thread([this]() {
+      int code = this->Wait();  // Will set atomic & promise (if still present).
+      // If Wait() executed before promise installed (race), attempt to publish now.
+      if (exit_code_promise_) {
+        try {
+          // set_value may throw on double set; ignore.
+          exit_code_promise_->set_value(code);
+        } catch (...) {
+        }
+      }
+    }).detach();
+  }
+
+  return exit_code_future_;
 }
 
 std::pair<Process, std::error_code> Process::Spawn(const std::vector<std::string> &args,

@@ -82,7 +82,8 @@ TEST(UtilTest, GetAllProcsWithPpid) {
 
 TEST(UtilTest, ProcessExitCode) {
   Process proc = Process::CreateNewDummy();
-  ASSERT_EQ(proc.ExitCode(), kStillRunning);
+  //dummy process exit code is immediately 0.
+  ASSERT_EQ(proc.ExitCode(), 0);
 }
 
 TEST(UtilTest, ProcessWaitCapturesExitCode) {
@@ -157,19 +158,18 @@ TEST(UtilTest, DummyProcessWait) {
   Process dummy = Process::CreateNewDummy();
   // Dummy process uses pid -1; it's a sentinel and not considered a valid spawned process.
   ASSERT_FALSE(dummy.IsValid());
-  ASSERT_EQ(dummy.ExitCode(), kStillRunning);
-  int code = dummy.Wait();
-  ASSERT_EQ(code, 0);  // Dummy mapped to 0 per implementation.
   ASSERT_EQ(dummy.ExitCode(), 0);
+  int code = dummy.Wait();
+  ASSERT_EQ(code, 0);
 }
 
 TEST(UtilTest, NullProcessBehavior) {
-  Process null_proc;  // default constructed is null
+  Process null_proc;
   ASSERT_TRUE(null_proc.IsNull());
-  ASSERT_EQ(null_proc.ExitCode(), kStillRunning);
-  int code = null_proc.Wait();
-  ASSERT_EQ(code, -1);  // Null mapped to -1 per implementation.
+  // null process has immediate terminal code -1.
   ASSERT_EQ(null_proc.ExitCode(), -1);
+  int code = null_proc.Wait();
+  ASSERT_EQ(code, -1);
 }
 
 #if !defined(_WIN32)
@@ -208,6 +208,184 @@ TEST(UtilTest, SpawnWritesPidFile) {
   // Clean up
   std::remove(pid_file.c_str());
   proc.Wait();
+}
+
+TEST(UtilTest, WaitAsyncReturnsReadyFutureIfAlreadyExited) {
+  std::vector<std::string> args = {"bash", "-c", "exit 42"};
+  auto pair = Process::Spawn(args, /*decouple*/ false);
+  ASSERT_FALSE(pair.second) << pair.second.message();
+  Process &proc = pair.first;
+  int code = proc.Wait();
+  ASSERT_EQ(code, 42);
+  auto fut = proc.WaitAsync();
+  ASSERT_TRUE(fut.valid());
+  ASSERT_TRUE(fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready);
+  ASSERT_EQ(fut.get(), 42);
+}
+
+TEST(UtilTest, WaitAsyncBasicCompletion) {
+  std::vector<std::string> args = {"bash", "-c", "sleep 1; exit 3"};
+  auto pair = Process::Spawn(args, /*decouple*/ false);
+  ASSERT_FALSE(pair.second) << pair.second.message();
+  Process &proc = pair.first;
+  auto fut = proc.WaitAsync();
+  ASSERT_TRUE(fut.valid());
+  // Wait with timeout loop to avoid hanging test in rare race.
+  for (int i = 0; i < 50 &&
+                  fut.wait_for(std::chrono::milliseconds(100)) !=
+                      std::future_status::ready; ++i) {
+  }
+  ASSERT_EQ(fut.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+  ASSERT_EQ(fut.get(), 3);
+  // ExitCode should now be updated.
+  ASSERT_EQ(proc.ExitCode(), 3);
+}
+
+TEST(UtilTest, WaitAsyncMultipleConsumersShareSameFuture) {
+  std::vector<std::string> args = {"bash", "-c", "sleep 1; exit 5"};
+  auto pair = Process::Spawn(args, /*decouple*/ false);
+  ASSERT_FALSE(pair.second) << pair.second.message();
+  Process &proc = pair.first;
+  auto f1 = proc.WaitAsync();
+  auto f2 = proc.WaitAsync();
+  ASSERT_TRUE(f1.valid());
+  ASSERT_TRUE(f2.valid());
+  // They should become ready around the same time with same value.
+  f1.wait();
+  f2.wait();
+  ASSERT_EQ(f1.get(), 5);
+  ASSERT_EQ(proc.ExitCode(), 5);
+  // Future remains valid for further get() via shared_future semantics.
+  ASSERT_EQ(f2.get(), 5);
+}
+
+TEST(UtilTest, WaitAsyncKillPath) {
+  std::vector<std::string> args = {"bash", "-c", "sleep 10"};
+  auto pair = Process::Spawn(args, /*decouple*/ false);
+  ASSERT_FALSE(pair.second) << pair.second.message();
+  Process &proc = pair.first;
+  auto fut = proc.WaitAsync();
+  proc.Kill();
+  // Wait for future to observe killed exit code.
+  for (int i = 0; i < 50 &&
+                  fut.wait_for(std::chrono::milliseconds(100)) !=
+                      std::future_status::ready; ++i) {
+  }
+  ASSERT_EQ(fut.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+  int code = fut.get();
+#ifdef _WIN32
+  ASSERT_EQ(code, static_cast<int>(ERROR_PROCESS_ABORTED));
+#else
+  // Could be 128 + SIGKILL if direct PID wait, or 0 if pipe mode; accept non-still-running.
+  ASSERT_NE(code, kStillRunning);
+#endif
+}
+
+TEST(UtilTest, WaitAsyncIdempotentFutureReference) {
+  std::vector<std::string> args = {"bash", "-c", "exit 9"};
+  auto pair = Process::Spawn(args, /*decouple*/ false);
+  ASSERT_FALSE(pair.second) << pair.second.message();
+  Process &proc = pair.first;
+  auto f1 = proc.WaitAsync();
+  auto f2 = proc.WaitAsync();
+  f1.wait();
+  f2.wait();
+  ASSERT_EQ(f1.get(), 9);
+  ASSERT_EQ(f2.get(), 9);
+  ASSERT_EQ(proc.ExitCode(), 9);
+}
+
+TEST(UtilTest, WaitAsyncSyncAfterAsync) {
+  std::vector<std::string> args = {"bash", "-c", "sleep 1; exit 11"};
+  auto pair = Process::Spawn(args, /*decouple*/ false);
+  ASSERT_FALSE(pair.second) << pair.second.message();
+  Process &proc = pair.first;
+  auto fut = proc.WaitAsync();
+  ASSERT_TRUE(fut.valid());
+  // Invoke synchronous wait while async waiter thread may also be waiting.
+  int code = proc.Wait();
+  ASSERT_EQ(code, 11);
+  // Future should now be ready with same value.
+  ASSERT_EQ(fut.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+  ASSERT_EQ(fut.get(), 11);
+  ASSERT_EQ(proc.ExitCode(), 11);
+}
+
+TEST(UtilTest, WaitAsyncImmediateDummy) {
+  Process dummy = Process::CreateNewDummy();
+  auto fut = dummy.WaitAsync();
+  ASSERT_TRUE(fut.valid());
+  ASSERT_EQ(fut.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+  ASSERT_EQ(fut.get(), 0);
+  ASSERT_EQ(dummy.ExitCode(), 0);
+}
+
+TEST(UtilTest, WaitAsyncImmediateNull) {
+  Process null_proc;  // default constructed
+  ASSERT_TRUE(null_proc.IsNull());
+  auto fut = null_proc.WaitAsync();
+  ASSERT_TRUE(fut.valid());
+  ASSERT_EQ(fut.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+  ASSERT_EQ(fut.get(), -1);
+  ASSERT_EQ(null_proc.ExitCode(), -1);
+}
+
+TEST(UtilTest, WaitAsyncManyParallelAsync) {
+  const int kNum = 20;
+  struct ProcFuturePair {
+    Process proc;
+    std::shared_future<int> fut;
+    int expected;
+  };
+  std::vector<ProcFuturePair> entries;
+  entries.reserve(kNum);
+  for (int i = 0; i < kNum; ++i) {
+    int expected = 20 + i;  // distinct exit code
+  std::vector<std::string> args;
+#ifdef _WIN32
+  // Use cmd.exe to exit with a distinct code; introduce slight staggering via a post-spawn sleep.
+  args = {"cmd.exe", "/C", "exit", std::to_string(expected)};
+#else
+  std::string cmd = "sleep 1; exit " + std::to_string(expected);
+  args = {"bash", "-c", cmd};
+#endif
+    auto pair = Process::Spawn(args, /*decouple*/ false);
+    ASSERT_FALSE(pair.second) << pair.second.message();
+    // Move the process into the vector first so its address remains valid for the
+    // lifetime of the waiter thread spawned by WaitAsync(). Calling WaitAsync() on a
+    // temporary that is then moved-from (and destroyed at end-of-loop) results in the
+    // waiter thread dereferencing a dead this pointer.
+    entries.emplace_back();
+    auto &slot = entries.back();
+    slot.expected = expected;
+    slot.proc = std::move(pair.first);
+  slot.fut = slot.proc.WaitAsync();
+  // Introduce a tiny delay between spawns on Windows to avoid all processes exiting
+  // before any waiter threads have a chance to start (gives a more mixed timing profile)
+#ifdef _WIN32
+  std::this_thread::sleep_for(std::chrono::milliseconds(40));
+#endif
+  }
+  // Poll until all futures ready or timeout.
+  const int kMaxLoops = 60;  // up to ~6s @100ms
+  for (int loop = 0; loop < kMaxLoops; ++loop) {
+    bool all_ready = true;
+    for (auto &e : entries) {
+      if (e.fut.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+        all_ready = false;
+        break;
+      }
+    }
+    if (all_ready) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  for (auto &e : entries) {
+    ASSERT_EQ(e.fut.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+    ASSERT_EQ(e.fut.get(), e.expected);
+    ASSERT_EQ(e.proc.ExitCode(), e.expected);
+  }
 }
 
 }  // namespace ray

@@ -31,6 +31,7 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+#include <mutex>
 
 #include "ray/util/compat.h"
 #include "ray/util/logging.h"
@@ -135,8 +136,13 @@ class Process {
   /// \return The exit code, or kStillRunning while the process is still running.
   int ExitCode() const;
   /// Asynchronously waits for the process to terminate.
-  /// \return A future that will be fulfilled with the process's exit code.
-  std::future<int> WaitAsync();
+  /// Lazily spawns a single detached waiter thread (on first call while still running)
+  /// that invokes Wait() and publishes the normalized exit code via a shared_future.
+  /// If the process has already terminated when first invoked, returns an immediately
+  /// ready shared_future containing the cached exit code.
+  /// Thread-safe and idempotent: multiple callers receive the same shared_future.
+  /// \return A shared_future fulfilled with the process's exit code.
+  std::shared_future<int> WaitAsync();
   /// Convenience function to start a process in the background.
   /// \param pid_file A file to write the PID of the spawned process in.
   static std::pair<Process, std::error_code> Spawn(
@@ -151,6 +157,12 @@ class Process {
   /// \return The process's exit code. Returns 0 for a dummy process, -1 for a null one,
   /// or -1 on unrecoverable wait error.
   int Wait() const;
+
+ private:
+  // Guard to ensure we only initialize the async wait state once.
+  mutable std::mutex wait_async_mu_;
+  // Cached shared future representing the exit code once available (ready or pending).
+  mutable std::shared_future<int> exit_code_future_;
 };
 
 // Get the Process ID of the parent process. If the parent process exits, the PID
