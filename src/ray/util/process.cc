@@ -195,13 +195,20 @@ class ProcessFD {
 
     // TODO(mehrdadn): Use clone() on Linux or posix_spawnp() on Mac to avoid duplicating
     // file descriptors into the child process, as that can be problematic.
-    int pipefds[2];  // Create pipe to get PID & track lifetime
+    // pipefds: only created when decoupling to (1) retrieve grandchild PID and
+    // (2) hold a read end whose closure signals process lifetime when we cannot waitpid.
+    int pipefds[2] = {-1, -1};
     int parent_lifetime_pipe[2];
 
-    // Create pipes to health check parent <> child.
-    // pipefds is used for parent to check child's health.
-    if (pipe(pipefds) == -1) {
-      pipefds[0] = pipefds[1] = -1;
+    if (decouple) {
+      // TODO: On modern Linux (>=5.3) replace this lifetime pipe +
+      // double-fork approach with pidfd_open() (and possibly pidfd_send_signal()) so
+      // we can (1) avoid the second fork, (2) poll() or epoll() directly on the pidfd,
+      // and (3) obtain the real exit status of decoupled processes instead of defaulting
+      // to 0. This will unify behavior with Windows where we always get the exit code.
+      if (pipe(pipefds) == -1) {
+        pipefds[0] = pipefds[1] = -1;
+      }
     }
     // parent_lifetime_pipe is used for child to check parent's health.
     if (pipe_to_stdin) {
@@ -210,18 +217,21 @@ class ProcessFD {
       }
     }
 
-    pid = pipefds[1] != -1 ? fork() : -1;
+    pid = fork();
 
-    // If we don't pipe to stdin close pipes that are not needed.
-    if (pid <= 0 && pipefds[0] != -1) {
-      close(pipefds[0]);  // not the parent, so close the read end of the pipe
-      pipefds[0] = -1;
-    }
-    if (pid != 0 && pipefds[1] != -1) {
-      close(pipefds[1]);  // not the child, so close the write end of the pipe
-      pipefds[1] = -1;
-      // make sure the read end of the pipe is closed on exec
-      SetFdCloseOnExec(pipefds[0]);
+    // Close unneeded ends of decouple pipe in each process.
+    if (decouple) {
+      if (pid <= 0 && pipefds[0] != -1) {
+        // Child (or failure path) closes read end.
+        close(pipefds[0]);
+        pipefds[0] = -1;
+      }
+      if (pid != 0 && pipefds[1] != -1) {
+        // Parent closes write end and marks read end CLOEXEC.
+        close(pipefds[1]);
+        pipefds[1] = -1;
+        SetFdCloseOnExec(pipefds[0]);
+      }
     }
 
     // Create a pipe and redirect the read pipe to a child's stdin.
@@ -248,7 +258,7 @@ class ProcessFD {
       parent_lifetime_pipe[1] = -1;
     }
 
-    if (pid == 0) {
+  if (pid == 0) {
       // Child process case. Reset the SIGCHLD handler.
       signal(SIGCHLD, SIG_DFL);
       // If process needs to be decoupled, double-fork to avoid zombies.
@@ -262,11 +272,11 @@ class ProcessFD {
         dup2(parent_lifetime_pipe[0], STDIN_FILENO);
       }
 
-      // This is the spawned process. Any intermediate parent is now dead.
+      // This is the spawned process (or grandchild if decoupled). Any intermediate parent is now dead.
       pid_t my_pid = getpid();
-      if (write(pipefds[1], &my_pid, sizeof(my_pid)) == sizeof(my_pid)) {
-        execvpe(
-            argv[0], const_cast<char *const *>(argv), const_cast<char *const *>(envp));
+      if (!decouple || (pipefds[1] != -1 &&
+                        write(pipefds[1], &my_pid, sizeof(my_pid)) == sizeof(my_pid))) {
+        execvpe(argv[0], const_cast<char *const *>(argv), const_cast<char *const *>(envp));
       }
       _exit(errno);  // fork() succeeded and exec() failed, so abort the child
     }
@@ -279,8 +289,8 @@ class ProcessFD {
         (void)r;  // can't do much if this fails, so ignore return value
       }
     }
-    // Use pipe to track process lifetime. (The pipe closes when process terminates.)
-    fd = pipefds[0];
+    // Only use lifetime pipe when decoupled; otherwise allow waitpid to get exit code.
+    fd = decouple ? pipefds[0] : -1;
     if (pid == -1) {
       ec = std::error_code(errno, std::system_category());
     }
