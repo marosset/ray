@@ -1,0 +1,43 @@
+--- a/src/google/protobuf/compiler/BUILD.bazel
++++ b/src/google/protobuf/compiler/BUILD.bazel
+@@ -119,10 +119,13 @@ cc_library(
+         "//src/google/protobuf/compiler/cpp",
+         "//src/google/protobuf/compiler/csharp",
+         "//src/google/protobuf/compiler/java",
+-        "//src/google/protobuf/compiler/objectivec",
+         "//src/google/protobuf/compiler/php",
+         "//src/google/protobuf/compiler/python",
+         "//src/google/protobuf/compiler/ruby",
+         "//src/google/protobuf/compiler/rust",
++    ] + select({
++        "@platforms//os:windows": [],
++        "//conditions:default": ["//src/google/protobuf/compiler/objectivec"],
++    }) + [
+         "@com_google_absl//absl/log:initialize",
+     ],
+ )
+--- a/src/google/protobuf/compiler/main.cc
++++ b/src/google/protobuf/compiler/main.cc
+@@ -34,7 +34,9 @@
+ #include "google/protobuf/compiler/csharp/csharp_generator.h"
+ #include "google/protobuf/compiler/java/generator.h"
+ #include "google/protobuf/compiler/java/kotlin_generator.h"
++#ifndef _WIN32
+ #include "google/protobuf/compiler/objectivec/generator.h"
++#endif
+ #include "google/protobuf/compiler/php/php_generator.h"
+ #include "google/protobuf/compiler/python/generator.h"
+ #include "google/protobuf/compiler/python/pyi_generator.h"
+@@ -105,10 +107,12 @@ int ProtobufMain(int argc, char* argv[]) {
+   cli.RegisterGenerator("--csharp_out", "--csharp_opt", &csharp_generator,
+                         "Generate C# source file.");
+ 
++#ifndef _WIN32
+   // Objective-C
+   objectivec::ObjectiveCGenerator objc_generator;
+   cli.RegisterGenerator("--objc_out", "--objc_opt", &objc_generator,
+                         "Generate Objective-C header and source.");
++#endif
+ 
+   // Rust
+   rust::RustGenerator rust_generator;

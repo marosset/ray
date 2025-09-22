@@ -98,6 +98,7 @@ def ray_deps_setup():
         ],
         patches = [
             "@com_github_grpc_grpc//third_party:protobuf.patch",
+            "//thirdparty/patches:protobuf-objc-windows-fix.patch",
         ],
         patch_args = ["-p1"],
     )
