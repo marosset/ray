@@ -946,6 +946,8 @@ class WorkerPool : public WorkerPoolInterface {
 
   friend class WorkerPoolTest;
   friend class WorkerPoolDriverRegisteredTest;
+  // Friend function used in tests to snapshot process handles in worker_pool.cc.
+  friend std::vector<Process> TestingGetAllWorkerProcesses(const WorkerPool &);
 };
 
 }  // namespace raylet

@@ -163,17 +163,42 @@ WorkerPool::WorkerPool(instrumented_io_context &io_service,
   }
 }
 
+namespace {
+// Standardized helper to perform unified async process cleanup.
+// Context tags allow downstream log filtering.
+static void KillAndAsyncWait(Process proc, const std::string &context_tag) {
+  if (!proc.IsValid() || proc.IsNull()) {
+    RAY_LOG(DEBUG) << "[proc_cleanup] ctx=" << context_tag
+                   << " pid=<invalid> skipped (null/invalid process)";
+    return;
+  }
+  if (!proc.IsAlive()) {
+    // Already exited; log cached exit code.
+    RAY_LOG(DEBUG) << "[proc_cleanup] ctx=" << context_tag << " pid=" << proc.GetId()
+                   << " already_exited exit_code=" << proc.ExitCode();
+    return;
+  }
+  // Kill and then asynchronously log exit code once available.
+  const pid_t pid = proc.GetId();
+  proc.Kill();
+  auto fut = proc.WaitAsync();
+  std::thread([fut, pid, context_tag]() mutable {
+    int exit_code = fut.get();
+    RAY_LOG(DEBUG) << "[proc_cleanup] ctx=" << context_tag << " pid=" << pid
+                   << " exit_code=" << exit_code;
+  }).detach();
+}
+}  // namespace
+
 WorkerPool::~WorkerPool() {
   std::unordered_set<Process> procs_to_kill;
   for (const auto &entry : states_by_lang_) {
-    // Kill all the worker processes.
     for (auto &worker_process : entry.second.worker_processes) {
       procs_to_kill.insert(worker_process.second.proc);
     }
   }
   for (Process proc : procs_to_kill) {
-    proc.Kill();
-    // NOTE: Avoid calling Wait() here. It fails with ECHILD, as SIGCHLD is disabled.
+    KillAndAsyncWait(proc, "worker_pool/destructor");
   }
 }
 
@@ -598,7 +623,7 @@ void WorkerPool::MonitorStartingWorkerProcess(StartupToken proc_startup_token,
                   : "The process is dead, probably it crashed during start.");
 
       if (it->second.proc.IsAlive()) {
-        it->second.proc.Kill();
+        KillAndAsyncWait(it->second.proc, "worker_pool/startup_timeout");
       }
 
       process_failed_pending_registration_++;
@@ -1228,6 +1253,7 @@ void WorkerPool::KillIdleWorker(const IdleWorkerEntry &entry) {
           if (!worker->IsDead()) {
             worker->MarkDead();
           }
+          KillAndAsyncWait(worker->GetProcess(), "worker_pool/idle_cleanup");
         } else {
           RAY_LOG(DEBUG) << "Failed to remove worker " << worker->WorkerId();
           // We re-insert the idle worker to the back of the queue if it fails to
@@ -1844,6 +1870,18 @@ const std::vector<std::string> &WorkerPool::LookupWorkerDynamicOptions(
 }
 
 const NodeID &WorkerPool::GetNodeID() const { return node_id_; }
+
+// Helper function so tests can call TestingGetAllWorkerProcesses(*worker_pool_instance).
+std::vector<Process> TestingGetAllWorkerProcesses(const WorkerPool &pool) {
+  std::vector<Process> result;
+  result.reserve(32);
+  for (const auto &kv : pool.states_by_lang_) {
+    for (const auto &proc_entry : kv.second.worker_processes) {
+      result.push_back(proc_entry.second.proc);
+    }
+  }
+  return result;
+}
 
 }  // namespace raylet
 

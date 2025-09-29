@@ -24,6 +24,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <fstream>
 
 #include "absl/time/time.h"
 #include "mock/ray/gcs/gcs_client/gcs_client.h"
@@ -162,10 +163,10 @@ class WorkerPoolMock : public WorkerPool {
     SetNodeManagerPort(1);
   }
 
-  ~WorkerPoolMock() {
-    // Avoid killing real processes
-    states_by_lang_.clear();
-  }
+  ~WorkerPoolMock() override = default;
+
+  // Advance mocked current time used by get_time callback.
+  void TickCurrentTimeMs(int64_t delta_ms) { current_time_ms_ += delta_ms; }
 
   using WorkerPool::StartWorkerProcess;  // we need this to be public for testing
 
@@ -180,9 +181,45 @@ class WorkerPoolMock : public WorkerPool {
 
   Process StartProcess(const std::vector<std::string> &worker_command_args,
                        const ProcessEnvironment &env) override {
-    // Use a bogus process ID that won't conflict with those in the system
-    auto pid = static_cast<pid_t>(PID_MAX_LIMIT + 1 + worker_commands_by_proc_.size());
-    last_worker_process_ = Process::FromPid(pid);
+  // Spawn an actual lightweight process so that Kill()+WaitAsync() observe
+  // genuine OS process lifecycle (exit code publication). On Windows we build
+  // the helper binary as //src/ray/util/tests:sleep_loop. Bazel places test
+  // runfiles on PATH for test targets; we still probe a couple of locations for
+  // dev ergonomics.
+    std::vector<std::string> cmd;
+#ifdef _WIN32
+    // The binary name produced by cc_binary is 'sleep_loop.exe'.
+    std::string exe;
+    // 1. Test runfiles directory (preferred inside Bazel test sandbox)
+    if (const char *test_srcdir = std::getenv("TEST_SRCDIR")) {
+      std::string candidate = std::string(test_srcdir) + "/io_ray/src/ray/util/tests/sleep_loop.exe";
+      if (std::ifstream(candidate).good()) {
+        exe = candidate;
+      }
+    }
+    // 2. Local bazel-bin path when running tests manually outside sandbox
+    if (exe.empty()) {
+      std::string candidate = "./bazel-bin/src/ray/util/tests/sleep_loop.exe";
+      if (std::ifstream(candidate).good()) {
+        exe = candidate;
+      }
+    }
+    // 3. Fallback to relying on PATH (should be set by runfiles manifest) using just the stem.
+    if (exe.empty()) {
+      exe = "sleep_loop.exe";
+    }
+#else
+    std::string exe = "sleep_loop";  // helper binary (POSIX) built in util/tests
+#endif
+    cmd.push_back(exe);
+    cmd.push_back("--millis=5000");  // 5s max runtime; we'll Kill earlier in tests
+    auto spawn_result = Process::Spawn(cmd, /*decouple*/ false, /*pid_file*/ "", env);
+    if (spawn_result.second) {
+      RAY_LOG(FATAL) << "Failed to spawn sleep_loop helper: "
+                     << spawn_result.second.message()
+                     << ". Ensure //src/ray/util/tests:sleep_loop is built and listed as a data dependency.";
+    }
+    last_worker_process_ = spawn_result.first;
     worker_commands_by_proc_[last_worker_process_] = worker_command_args;
     startup_tokens_by_proc_[last_worker_process_] =
         WorkerPool::worker_startup_token_counter_;
@@ -2149,6 +2186,192 @@ TEST_F(WorkerPoolDriverRegisteredTest, WorkerNoLeaks) {
   ASSERT_EQ(worker_pool_->GetIdleWorkerSize(), 0);
   ASSERT_EQ(worker_pool_->GetProcessSize(), 1);
   worker_pool_->ClearProcesses();
+}
+
+// Async cleanup verification: ensure that when the worker pool is destroyed after
+// spawning workers, all underlying processes have been killed and their exit codes
+// become available without blocking the main thread.
+TEST_F(WorkerPoolDriverRegisteredTest, AsyncDestructorProcessCleanup) {
+  // Start one worker via PopWorker -> PushWorkers (do not dispatch so it becomes idle).
+  auto lease_spec = ExampleLeaseSpec();
+  worker_pool_->PopWorker(lease_spec,
+                          [](const std::shared_ptr<WorkerInterface> worker,
+                             PopWorkerStatus status,
+                             const std::string &runtime_env_setup_error_message) {
+                            return false;  // don't dispatch so it will later be idle
+                          });
+  worker_pool_->PushWorkers(0, lease_spec.JobId());
+  ASSERT_GE(worker_pool_->GetProcessSize(), 1);
+
+  // Capture processes before initiating kill sequence.
+  std::vector<Process> procs = TestingGetAllWorkerProcesses(*worker_pool_);
+  ASSERT_FALSE(procs.empty());
+
+  // Emulate destructor-driven cleanup: finishing the job + idle cleanup triggers Kill()
+  // and WaitAsync waiter thread without destroying the pool object (avoids races with
+  // internal maps being torn down).
+  worker_pool_->HandleJobFinished(lease_spec.JobId());
+  worker_pool_->TryKillingIdleWorkers();
+  // Drain any mock Exit RPC callbacks if present.
+  for (auto &[wid, mock_client] : mock_worker_rpc_clients_) {
+    while (mock_client->ExitReplySucceed()) {
+    }
+  }
+
+  // Poll for async exit code resolution (allow short sleeps + optional io_service poll).
+  for (auto &p : procs) {
+    auto fut = p.WaitAsync();
+    const auto start = std::chrono::steady_clock::now();
+    while (fut.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready &&
+           std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(0)), std::future_status::ready)
+        << "Process WaitAsync future not ready";
+    ASSERT_NE(p.ExitCode(), kStillRunning) << "Process did not exit asynchronously";
+  }
+}
+
+// Async idle worker cleanup verification: after idle worker forced exit (job finished),
+// its process should be killed and exit code available without blocking.
+TEST_F(WorkerPoolDriverRegisteredTest, AsyncIdleWorkerCleanupExitCodeReady) {
+  auto lease_spec = ExampleLeaseSpec();
+  // Start & register one worker.
+  worker_pool_->PopWorker(lease_spec,
+                          [](const std::shared_ptr<WorkerInterface> worker,
+                             PopWorkerStatus status,
+                             const std::string &runtime_env_setup_error_message) {
+                            return false; // don't dispatch
+                          });
+  worker_pool_->PushWorkers(0, lease_spec.JobId());
+  ASSERT_EQ(worker_pool_->GetIdleWorkerSize(), 1);
+
+  // Capture process before job finish.
+  Process proc;
+  for (const auto &p : TestingGetAllWorkerProcesses(*worker_pool_)) {
+    proc = p;
+  }
+  ASSERT_TRUE(proc.IsValid());
+  ASSERT_EQ(proc.ExitCode(), kStillRunning);
+
+  // Finish the job causing idle worker to be force killed in TryKillingIdleWorkers.
+  worker_pool_->HandleJobFinished(lease_spec.JobId());
+  worker_pool_->TryKillingIdleWorkers();
+
+  // Simulate successful Exit RPC from mock client (force path already handled above in
+  // TryKillingIdleWorkers when job finished). Complete pending Exit callback.
+  for (auto &[wid, mock_client] : mock_worker_rpc_clients_) {
+    while (mock_client->ExitReplySucceed()) {
+    }
+  }
+
+  // Poll for async exit code publication.
+  auto fut = proc.WaitAsync();
+  const auto start = std::chrono::steady_clock::now();
+  while (fut.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready &&
+         std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_EQ(fut.wait_for(std::chrono::seconds(0)), std::future_status::ready)
+      << "Idle worker process WaitAsync future not ready.";
+  ASSERT_NE(proc.ExitCode(), kStillRunning) << "Idle worker process exit code not ready.";
+}
+
+// Async startup timeout path: spawn a worker with artificially induced timeout and
+// ensure Kill()+WaitAsync resolves exit code.
+TEST_F(WorkerPoolDriverRegisteredTest, AsyncStartupTimeoutCleanup) {
+  // Use a spec that will cause a runtime env failure so worker stays pending and hits
+  // timeout. We simulate by advancing time beyond WORKER_REGISTER_TIMEOUT_SECONDS.
+  auto lease_spec = ExampleLeaseSpec();
+  worker_pool_->PopWorker(lease_spec,
+                          [](const std::shared_ptr<WorkerInterface> worker,
+                             PopWorkerStatus status,
+                             const std::string &runtime_env_setup_error_message) {
+                            return false; // do not dispatch
+                          });
+
+  // Capture process before timeout.
+  Process proc;
+  for (const auto &p : TestingGetAllWorkerProcesses(*worker_pool_)) {
+    proc = p;
+  }
+  ASSERT_TRUE(proc.IsValid());
+  ASSERT_EQ(proc.ExitCode(), kStillRunning);
+
+  // Advance time beyond register timeout and invoke CheckStartingWorkerProcessRegistration.
+  static_cast<WorkerPoolMock *>(worker_pool_.get())
+    ->TickCurrentTimeMs((WORKER_REGISTER_TIMEOUT_SECONDS + 1) * 1000 /* ms advance */);
+  // Pump io service so the timer callback runs.
+  io_service_.poll();
+  io_service_.reset();
+
+  // Poll for exit code resolution.
+  auto fut = proc.WaitAsync();
+  const auto start = std::chrono::steady_clock::now();
+  while (fut.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready &&
+         std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_EQ(fut.wait_for(std::chrono::seconds(0)), std::future_status::ready)
+      << "Startup-timeout worker process WaitAsync future not ready.";
+  ASSERT_NE(proc.ExitCode(), kStillRunning)
+      << "Startup-timeout worker process exit code not resolved asynchronously.";
+}
+
+// Verify that invoking Kill logic (via idle cleanup + explicit second phase) multiple
+// times on the same underlying process is idempotent and WaitAsync shared future is
+// reused (no hang, no crash, exit_code stable).
+TEST_F(WorkerPoolDriverRegisteredTest, MultipleKillAttemptsIdempotent) {
+  auto lease_spec = ExampleLeaseSpec();
+  // Start + register worker (idle path).
+  worker_pool_->PopWorker(lease_spec,
+                          [](const std::shared_ptr<WorkerInterface> worker,
+                             PopWorkerStatus status,
+                             const std::string &runtime_env_setup_error_message) {
+                            return false; // do not dispatch
+                          });
+  worker_pool_->PushWorkers(0, lease_spec.JobId());
+  ASSERT_EQ(worker_pool_->GetIdleWorkerSize(), 1);
+
+  // Capture process before kill.
+  Process proc;
+  for (const auto &p : TestingGetAllWorkerProcesses(*worker_pool_)) {
+    proc = p;
+  }
+  ASSERT_TRUE(proc.IsValid());
+  ASSERT_EQ(proc.ExitCode(), kStillRunning);
+
+  // Force job finished so idle cleanup will kill.
+  worker_pool_->HandleJobFinished(lease_spec.JobId());
+  worker_pool_->TryKillingIdleWorkers();
+  // Complete Exit RPC callback(s).
+  for (auto &[wid, mock_client] : mock_worker_rpc_clients_) {
+    while (mock_client->ExitReplySucceed()) {
+    }
+  }
+
+  // First async wait (should progress to ready soon).
+  auto fut1 = proc.WaitAsync();
+  const auto start = std::chrono::steady_clock::now();
+  while (fut1.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready &&
+         std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_EQ(fut1.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+  int code1 = fut1.get();
+  ASSERT_NE(code1, kStillRunning);
+
+  // Simulate a second Kill attempt after process already dead; should be harmless.
+  proc.Kill();  // Should not change recorded exit code.
+  int code_after_second_kill = proc.ExitCode();
+  ASSERT_EQ(code_after_second_kill, code1);
+
+  // Third Kill + second WaitAsync() retrieval returns the same ready shared_future.
+  proc.Kill();
+  auto fut2 = proc.WaitAsync();
+  ASSERT_EQ(fut2.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+  int code2 = fut2.get();
+  ASSERT_EQ(code2, code1);
 }
 
 TEST_F(WorkerPoolDriverRegisteredTest, PopWorkerStatus) {

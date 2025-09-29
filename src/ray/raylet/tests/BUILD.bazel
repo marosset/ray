@@ -29,6 +29,7 @@ ray_cc_test(
         "no_tsan",
         "team:core",
     ],
+    data = ["//src/ray/util/tests:sleep_loop"],
     deps = [
         "//:ray_mock",
         "//src/ray/raylet:worker_pool",
