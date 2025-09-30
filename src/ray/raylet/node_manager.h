@@ -217,6 +217,10 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   /// Stop this node manager.
   void Stop();
 
+    // Non-blocking summary of current agent process states (for testing & shutdown
+    // logging). Format defined by FormatAgentShutdownSummary in agent_manager.cc.
+    std::string FormatAgentShutdownSummary() const;
+
   /// Query all of local core worker states.
   ///
   /// \param on_replied A callback that's called when each of query RPC is replied.

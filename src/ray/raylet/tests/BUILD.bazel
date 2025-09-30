@@ -40,6 +40,35 @@ ray_cc_test(
 )
 
 ray_cc_test(
+    name = "agent_manager_test",
+    size = "small",
+    srcs = ["agent_manager_test.cc"],
+    tags = [
+        "team:core",
+    ],
+    data = ["//src/ray/util/tests:sleep_loop"],
+    deps = [
+        "//:ray_mock",
+        "//src/ray/raylet:agent_manager",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+ray_cc_test(
+    name = "agent_manager_summary_test",
+    size = "small",
+    srcs = ["agent_manager_summary_test.cc"],
+    tags = [
+        "team:core",
+    ],
+    data = ["//src/ray/util/tests:sleep_loop"],
+    deps = [
+        "//src/ray/raylet:agent_manager",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+ray_cc_test(
     name = "local_object_manager_test",
     size = "small",
     srcs = [

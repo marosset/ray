@@ -2723,8 +2723,18 @@ void NodeManager::Stop() {
   // This never fails.
   RAY_CHECK_OK(store_client_.Disconnect());
   object_manager_.Stop();
+  // Emit a one-line summary before destroying agent managers.
+  RAY_LOG(INFO) << "Agent shutdown summary: "
+                << FormatAgentShutdownSummary();
   dashboard_agent_manager_.reset();
   runtime_env_agent_manager_.reset();
+}
+
+std::string NodeManager::FormatAgentShutdownSummary() const {
+  std::vector<AgentManager *> agents;
+  agents.push_back(dashboard_agent_manager_.get());
+  agents.push_back(runtime_env_agent_manager_.get());
+  return ray::raylet::FormatAgentShutdownSummary(agents);
 }
 
 void NodeManager::RecordMetrics() {

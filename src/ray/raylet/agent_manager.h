@@ -86,8 +86,25 @@ class AgentManager {
   std::function<void(const rpc::NodeDeathInfo &)> shutdown_raylet_gracefully_;
   // If true, when the agent dies, raylet kills itself.
   std::atomic<bool> fate_shares_;
-  std::unique_ptr<std::thread> monitor_thread_;
+  // Shared future publishing the agent process exit code (WaitAsync contract).
+  std::shared_future<int> exit_future_;
+  // Thread that observes the published exit code to perform fate-sharing actions.
+  std::unique_ptr<std::thread> fate_share_thread_;
+
+  friend std::shared_future<int> TestingGetAgentExitFuture(AgentManager &mgr);
+  friend std::string FormatAgentShutdownSummary(const std::vector<AgentManager *> &agents);
 };
+
+// Test-only accessor mirroring pattern used in other components (e.g., WorkerPool) to
+// avoid expanding the public API surface.
+inline std::shared_future<int> TestingGetAgentExitFuture(AgentManager &mgr) {
+  return mgr.exit_future_;
+}
+
+// Produce a lightweight summary string for a set of AgentManager instances. Format:
+// [{name:dashboard_agent,ready:1,exit_code:0,fate_shares:1}, ...]
+// Non-blocking: futures polled with wait_for(0).
+std::string FormatAgentShutdownSummary(const std::vector<AgentManager *> &agents);
 
 }  // namespace raylet
 }  // namespace ray

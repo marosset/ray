@@ -4,7 +4,7 @@ ray_cc_library(
     name = "agent_manager",
     srcs = ["agent_manager.cc"],
     hdrs = ["agent_manager.h"],
-    visibility = ["//visibility:private"],
+    visibility = [":__subpackages__"],
     deps = [
         "//src/ray/common:id",
         "//src/ray/common:ray_config",
