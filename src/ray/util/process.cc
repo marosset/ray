@@ -533,11 +533,11 @@ std::shared_future<int> Process::WaitAsync() {
   }
 
   if (spawn_waiter) {
-    // Launch detached waiter thread to perform blocking Wait() and fulfill promise.
+    // Launch detached waiter thread to perform blocking wait and fulfill promise.
     // Assumption: caller retains Process object lifetime until future becomes ready.
     std::thread([this]() {
-      int code = this->Wait();  // Will set atomic & promise (if still present).
-      // If Wait() executed before promise installed (race), attempt to publish now.
+      int code = this->DoWait();  // Direct OS wait, bypasses future check.
+      // If DoWait() executed before promise installed (race), attempt to publish now.
       if (exit_code_promise_) {
         try {
           // set_value may throw on double set; ignore.
@@ -571,12 +571,9 @@ std::pair<Process, std::error_code> Process::Spawn(const std::vector<std::string
   return std::make_pair(std::move(proc), error);
 }
 
-int Process::Wait() const {
-  int cached = exit_code_.load(std::memory_order_acquire);
-  if (cached != kStillRunning) {
-    return cached;  // already waited
-  }
-
+int Process::DoWait() const {
+  // Internal wait implementation that directly waits on OS primitives.
+  // This is called by both Wait() and the WaitAsync() detached thread.
   int result = -1;
   if (!p_) {
     result = -1;  // null process
@@ -647,6 +644,32 @@ int Process::Wait() const {
     }
   }
   return result;
+}
+
+int Process::Wait() const {
+  int cached = exit_code_.load(std::memory_order_acquire);
+  if (cached != kStillRunning) {
+    return cached;  // already waited
+  }
+
+  // Check if WaitAsync() has already been called and a waiter thread is active.
+  // If so, wait on the future instead of trying to wait on the OS handle directly,
+  // which would fail on Windows (handle can only be waited on once).
+  std::shared_future<int> async_future;
+  {
+    std::lock_guard<std::mutex> lk(wait_async_mu_);
+    if (exit_code_future_.valid()) {
+      async_future = exit_code_future_;
+    }
+  }
+  if (async_future.valid()) {
+    // WaitAsync() waiter thread is handling the OS wait; piggyback on its future.
+    async_future.wait();
+    return async_future.get();
+  }
+
+  // No async wait in progress; perform synchronous wait directly.
+  return DoWait();
 }
 
 bool Process::IsAlive() const {

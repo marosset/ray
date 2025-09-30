@@ -164,11 +164,18 @@ class Process {
   /// normalized exit code (WEXITSTATUS / Windows GetExitCodeProcess). Subsequent calls
   /// return the cached value immediately. Not supported for unowned processes that were
   /// not spawned via this API (will return -1 if unable to obtain status).
+  /// If WaitAsync() was called first, this delegates to the async waiter thread to avoid
+  /// double-waiting on the same OS handle (which fails on Windows).
   /// \return The process's exit code. Returns 0 for a dummy process, -1 for a null one,
   /// or -1 on unrecoverable wait error.
   int Wait() const;
 
  private:
+  /// Internal implementation that directly waits on OS primitives.
+  /// Used by both Wait() and the WaitAsync() detached thread.
+  /// Should not be called directly if WaitAsync() has already been invoked.
+  int DoWait() const;
+
   // Guard to ensure we only initialize the async wait state once.
   mutable std::mutex wait_async_mu_;
   // Cached shared future representing the exit code once available (ready or pending).

@@ -330,6 +330,78 @@ TEST(UtilTest, WaitAsyncImmediateNull) {
   ASSERT_EQ(null_proc.ExitCode(), -1);
 }
 
+TEST(UtilTest, WaitAsyncThenKillNoDoubleWait) {
+  // Regression test for Windows race: WaitAsync() spawns a detached thread that waits
+  // on the process handle. If Kill() is then called (which also waits), both threads
+  // would try to wait on the same handle. On Windows, this fails with ERROR_INVALID_HANDLE.
+  // The fix: Wait() checks if WaitAsync() is active and delegates to the future instead.
+  std::vector<std::string> args = {"bash", "-c", "sleep 10"};
+  auto pair = Process::Spawn(args, /*decouple*/ false);
+  ASSERT_FALSE(pair.second) << pair.second.message();
+  Process &proc = pair.first;
+  
+  // Call WaitAsync first, spawning the detached waiter thread
+  auto fut = proc.WaitAsync();
+  ASSERT_TRUE(fut.valid());
+  
+  // Give the waiter thread a brief moment to start waiting
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  
+  // Now kill the process. This internally calls Wait(), which must NOT
+  // try to wait on the OS handle again (would fail on Windows).
+  proc.Kill();
+  
+  // Future should become ready with killed exit code
+  fut.wait();
+  int code = fut.get();
+#ifdef _WIN32
+  ASSERT_EQ(code, static_cast<int>(ERROR_PROCESS_ABORTED));
+#else
+  ASSERT_NE(code, kStillRunning);
+#endif
+  
+  // ExitCode should be updated
+  ASSERT_EQ(proc.ExitCode(), code);
+  
+  // Additional Wait() calls should return cached value without error
+  ASSERT_EQ(proc.Wait(), code);
+}
+
+TEST(UtilTest, MultipleWaitCallsWhileWaitAsyncActive) {
+  // Test that multiple threads can call Wait() concurrently while WaitAsync()
+  // is active, and all should properly delegate to the async waiter's future.
+  std::vector<std::string> args = {"bash", "-c", "sleep 2; exit 13"};
+  auto pair = Process::Spawn(args, /*decouple*/ false);
+  ASSERT_FALSE(pair.second) << pair.second.message();
+  Process &proc = pair.first;
+  
+  auto fut = proc.WaitAsync();
+  
+  // Spawn multiple threads that all call Wait()
+  std::vector<std::thread> waiters;
+  std::vector<int> results(3, kStillRunning);
+  for (int i = 0; i < 3; ++i) {
+    waiters.emplace_back([&proc, &results, i]() {
+      results[i] = proc.Wait();
+    });
+  }
+  
+  // Wait for all threads to complete
+  for (auto &t : waiters) {
+    t.join();
+  }
+  
+  fut.wait();
+  int expected = fut.get();
+  ASSERT_EQ(expected, 13);
+  
+  // All Wait() calls should have returned the same exit code
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(results[i], expected);
+  }
+  ASSERT_EQ(proc.ExitCode(), expected);
+}
+
 TEST(UtilTest, WaitAsyncManyParallelAsync) {
   const int kNum = 20;
   struct ProcFuturePair {
