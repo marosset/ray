@@ -23,6 +23,8 @@
 #include <queue>
 #include <string>
 #include <utility>
+#include <sstream>
+#include <chrono>
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/strings/str_format.h"
@@ -283,7 +285,15 @@ class HttpRuntimeEnvAgentClient : public RuntimeEnvAgentClient {
         shutdown_raylet_gracefully_(shutdown_raylet_gracefully),
         agent_register_timeout_ms_(agent_register_timeout_ms),
         agent_manager_retry_interval_ms_(agent_manager_retry_interval_ms) {}
-  ~HttpRuntimeEnvAgentClient() override = default;
+  ~HttpRuntimeEnvAgentClient() override {
+    // Ensure any still-running tracked processes are terminated to avoid leaks in
+    // test scenarios.
+    for (auto &tp : tracked_processes_) {
+      if (tp.process.IsValid()) {
+        tp.process.Kill();
+      }
+    }
+  }
 
   template <typename T>
   using SuccCallback = std::function<void(T)>;
@@ -520,6 +530,66 @@ class HttpRuntimeEnvAgentClient : public RuntimeEnvAgentClient {
   std::function<void(const rpc::NodeDeathInfo &)> shutdown_raylet_gracefully_;
   const uint32_t agent_register_timeout_ms_;
   const uint32_t agent_manager_retry_interval_ms_;
+
+  // Optional tracked helper processes for runtime environment management (currently test only).
+  // Uses std::deque to ensure stable addresses for Process objects whose WaitAsync()
+  // detached threads capture `this`; vector reallocation would invalidate those pointers.
+  std::deque<TrackedProcessEntry> tracked_processes_;
+
+ public:
+  // ---------------- Tracked process test APIs ----------------
+  std::shared_future<int> StartTrackedProcess(const std::vector<std::string> &argv,
+                                              const std::string &name) override {
+    std::vector<const char *> c_argv;
+    c_argv.reserve(argv.size() + 1);
+    for (auto &a : argv) c_argv.push_back(a.c_str());
+    c_argv.push_back(nullptr);
+    std::error_code ec;
+    ProcessEnvironment env;  // empty
+    Process proc(c_argv.data(), nullptr, ec, false, env, /*pipe_stdin*/ false);
+    if (!proc.IsValid() || ec) {
+      RAY_LOG(ERROR) << "Failed to start tracked runtime env process '" << name
+                     << "': " << ec.message();
+      std::promise<int> p; p.set_value(-1);
+      auto fut = p.get_future().share();
+      tracked_processes_.push_back(TrackedProcessEntry{name, Process(), fut});
+      return fut;
+    }
+    // IMPORTANT: move the process into the vector BEFORE calling WaitAsync so the
+    // detached waiter thread captures a stable Process object (avoid dangling `this`).
+    tracked_processes_.push_back(TrackedProcessEntry{name, std::move(proc), {}});
+    auto &entry = tracked_processes_.back();
+    entry.exit_future = entry.process.WaitAsync();
+    return entry.exit_future;
+  }
+
+  void KillTrackedProcess(const std::string &name) override {
+    for (auto &tp : tracked_processes_) {
+      if (tp.name == name && tp.process.IsValid()) {
+        tp.process.Kill();
+        return;
+      }
+    }
+  }
+
+  std::string FormatTrackedProcessSummary() const override {
+    std::ostringstream out;
+    out << "[";
+    bool first = true;
+    for (auto &tp : tracked_processes_) {
+      if (!first) out << ","; else first = false;
+      bool ready = false; int code = 0;
+      if (tp.exit_future.valid() &&
+          tp.exit_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        ready = true; code = tp.exit_future.get();
+      }
+      out << "{name:" << tp.name << ",ready:" << (ready ? 1 : 0);
+      if (ready) out << ",exit_code:" << code;
+      out << "}";
+    }
+    out << "]";
+    return out.str();
+  }
 };
 }  // namespace
 

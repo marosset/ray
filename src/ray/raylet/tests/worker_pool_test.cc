@@ -130,6 +130,26 @@ class MockRuntimeEnvAgentClient : public RuntimeEnvAgentClient {
     RAY_CHECK(runtime_env_reference[serialized_runtime_env] >= 0);
     callback(true);
   };
+
+  // Mock implementations for runtime environment tracked process management.
+  // These methods provide no-op or minimal functionality since WorkerPool tests
+  // focus on worker lifecycle rather than process tracking capabilities.
+  std::shared_future<int> StartTrackedProcess(
+      const std::vector<std::string> &cmdline, const std::string &name) override {
+    // Return immediately-ready future with success exit code
+    std::promise<int> p;
+    p.set_value(0);
+    return p.get_future().share();
+  }
+
+  void KillTrackedProcess(const std::string &name) override {
+    // No-op for mock
+  }
+
+  std::string FormatTrackedProcessSummary() const override {
+    // Return empty summary for mock
+    return "";
+  }
 };
 
 class WorkerPoolMock : public WorkerPool {

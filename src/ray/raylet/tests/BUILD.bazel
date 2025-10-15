@@ -124,6 +124,21 @@ ray_cc_test(
 )
 
 ray_cc_test(
+    name = "runtime_env_process_tracker_test",
+    size = "small",
+    srcs = ["runtime_env_process_tracker_test.cc"],
+    tags = ["team:core"],
+    data = ["//src/ray/util/tests:sleep_loop"],
+    deps = [
+        "//:ray_mock",
+        "//src/ray/common:asio",
+        "//src/ray/raylet:runtime_env_agent_client",
+        "//src/ray/util:process",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+ray_cc_test(
     name = "lease_dependency_manager_test",
     size = "small",
     srcs = ["lease_dependency_manager_test.cc"],

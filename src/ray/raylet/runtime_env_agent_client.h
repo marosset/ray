@@ -16,6 +16,7 @@
 
 #include <boost/asio/deadline_timer.hpp>
 #include <csignal>
+#include <deque>
 #include <memory>
 #include <string>
 #include <utility>
@@ -24,6 +25,7 @@
 #include "ray/common/asio/instrumented_io_context.h"
 #include "ray/common/id.h"
 #include "ray/common/ray_config.h"
+#include "ray/util/process.h"
 #include "src/ray/protobuf/gcs.pb.h"
 #include "src/ray/protobuf/public/runtime_environment.pb.h"
 
@@ -83,6 +85,35 @@ class RuntimeEnvAgentClient {
 
   // NOTE: The service has another method `GetRuntimeEnvsInfo` but nobody in raylet uses
   // it.
+
+    // ---------------------------------------------------------------
+    // Test support: tracked helper processes
+    // ---------------------------------------------------------------
+    // These methods allow tests (and future runtime env integration work) to launch and
+    // observe helper subprocesses (e.g., environment build / packaging commands) using
+    // the same WaitAsync + shared_future pattern adopted by AgentManager.
+    // Production code does not currently call these; they are intentionally lightweight
+    // and side-effect free unless invoked.
+
+    struct TrackedProcessEntry {
+        std::string name;
+        Process process;
+        std::shared_future<int> exit_future;
+    };
+
+    // Launch a process (argv vector, first element is executable path) and begin async
+    // exit tracking. Returns the shared_future for convenience (ready immediately if
+    // process failed to start). On failure, the future will be ready with value -1.
+    // Thread-safe for test usage under assumption of external serialization.
+    virtual std::shared_future<int> StartTrackedProcess(
+            const std::vector<std::string> &argv, const std::string &name) = 0;
+
+    // Best-effort kill by name. No-op if name not found.
+    virtual void KillTrackedProcess(const std::string &name) = 0;
+
+    // Produce non-blocking summary JSON-like array similar to AgentManager summary:
+    // [{name:env_build,ready:1,exit_code:0},{name:env_long,ready:0}]
+    virtual std::string FormatTrackedProcessSummary() const = 0;
 };
 
 }  // namespace raylet
