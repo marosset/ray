@@ -16,8 +16,10 @@
 
 #include <algorithm>
 #include <boost/date_time/posix_time/posix_time.hpp>
+#include <chrono>
 #include <deque>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -26,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
 #include "ray/common/constants.h"
 #include "ray/common/lease/lease_spec.h"
@@ -192,12 +195,13 @@ static void KillAndAsyncWait(Process proc, const std::string &context_tag) {
 
 WorkerPool::~WorkerPool() {
   std::unordered_set<Process> procs_to_kill;
-  for (const auto &entry : states_by_lang_) {
+  for (auto &entry : states_by_lang_) {
     for (auto &worker_process : entry.second.worker_processes) {
+      FinalizeRuntimeEnvProcess(worker_process.second, "worker_pool/destructor");
       procs_to_kill.insert(worker_process.second.proc);
     }
   }
-  for (Process proc : procs_to_kill) {
+  for (const Process &proc : procs_to_kill) {
     KillAndAsyncWait(proc, "worker_pool/destructor");
   }
 }
@@ -271,7 +275,9 @@ void WorkerPool::AddWorkerProcess(
     const std::chrono::high_resolution_clock::time_point &start,
     const rpc::RuntimeEnvInfo &runtime_env_info,
     const std::vector<std::string> &dynamic_options,
-    std::optional<absl::Duration> worker_startup_keep_alive_duration) {
+    std::optional<absl::Duration> worker_startup_keep_alive_duration,
+    std::string runtime_env_process_name,
+    std::shared_future<int> runtime_env_process_future) {
   state.worker_processes.emplace(worker_startup_token_counter_,
                                  WorkerProcessInfo{/*is_pending_registration=*/true,
                                                    worker_type,
@@ -279,12 +285,19 @@ void WorkerPool::AddWorkerProcess(
                                                    start,
                                                    runtime_env_info,
                                                    dynamic_options,
-                                                   worker_startup_keep_alive_duration});
+                                                   worker_startup_keep_alive_duration,
+                                                   std::move(runtime_env_process_future),
+                                                   std::move(runtime_env_process_name)});
 }
 
 void WorkerPool::RemoveWorkerProcess(State &state,
-                                     const StartupToken &proc_startup_token) {
-  state.worker_processes.erase(proc_startup_token);
+                                     const StartupToken &proc_startup_token,
+                                     std::string_view context_tag) {
+  auto it = state.worker_processes.find(proc_startup_token);
+  if (it != state.worker_processes.end()) {
+    FinalizeRuntimeEnvProcess(it->second, context_tag);
+    state.worker_processes.erase(it);
+  }
 }
 
 std::pair<std::vector<std::string>, ProcessEnvironment>
@@ -562,18 +575,35 @@ std::tuple<Process, StartupToken> WorkerPool::StartWorkerProcess(
     AdjustWorkerOomScore(proc.GetId());
   }
   MonitorStartingWorkerProcess(worker_startup_token_counter_, language, worker_type);
+  std::string runtime_env_process_name;
+  std::shared_future<int> runtime_env_process_future;
+  const bool has_runtime_env =
+      !IsRuntimeEnvEmpty(runtime_env_info.serialized_runtime_env());
+  if (runtime_env_agent_client_ && has_runtime_env && proc.IsValid()) {
+    runtime_env_process_name =
+        absl::StrFormat("runtime_env_helper/pid=%d/token=%lld",
+                        static_cast<int>(proc.GetId()),
+                        static_cast<long long>(worker_startup_token_counter_));
+    runtime_env_process_future =
+        runtime_env_agent_client_->TrackExistingProcess(proc, runtime_env_process_name);
+  }
   AddWorkerProcess(state,
                    worker_type,
                    proc,
                    start,
                    runtime_env_info,
                    dynamic_options,
-                   worker_startup_keep_alive_duration);
+                   worker_startup_keep_alive_duration,
+                   std::move(runtime_env_process_name),
+                   std::move(runtime_env_process_future));
   StartupToken worker_startup_token = worker_startup_token_counter_;
   update_worker_startup_token_counter();
   if (IsIOWorkerType(worker_type)) {
     auto &io_worker_state = GetIOWorkerStateFromWorkerType(worker_type, state);
     io_worker_state.num_starting_io_workers++;
+  }
+  if (status != nullptr) {
+    *status = PopWorkerStatus::OK;
   }
   return {proc, worker_startup_token};
 }
@@ -628,7 +658,7 @@ void WorkerPool::MonitorStartingWorkerProcess(StartupToken proc_startup_token,
 
       process_failed_pending_registration_++;
       DeleteRuntimeEnvIfPossible(it->second.runtime_env_info.serialized_runtime_env());
-      RemoveWorkerProcess(state, proc_startup_token);
+      RemoveWorkerProcess(state, proc_startup_token, "worker_pool/startup_timeout");
       if (IsIOWorkerType(worker_type)) {
         // Mark the I/O worker as failed.
         auto &io_worker_state = GetIOWorkerStateFromWorkerType(worker_type, state);
@@ -1580,7 +1610,9 @@ void WorkerPool::DisconnectWorker(const std::shared_ptr<WorkerInterface> &worker
     }
 
     DeleteRuntimeEnvIfPossible(serialized_runtime_env);
-    RemoveWorkerProcess(state, worker->GetStartupToken());
+    const auto context_tag = absl::StrFormat("worker_pool/disconnect/%s",
+                                             rpc::WorkerExitType_Name(disconnect_type));
+    RemoveWorkerProcess(state, worker->GetStartupToken(), context_tag);
   }
   RAY_CHECK(RemoveWorker(state.registered_workers, worker));
 
@@ -1870,6 +1902,40 @@ const std::vector<std::string> &WorkerPool::LookupWorkerDynamicOptions(
 }
 
 const NodeID &WorkerPool::GetNodeID() const { return node_id_; }
+
+void WorkerPool::FinalizeRuntimeEnvProcess(WorkerProcessInfo &info,
+                                           std::string_view context_tag) {
+  if (info.runtime_env_process_name.empty()) {
+    return;
+  }
+  if (runtime_env_agent_client_) {
+    runtime_env_agent_client_->KillTrackedProcess(info.runtime_env_process_name);
+  }
+  if (info.runtime_env_process_future.valid()) {
+    auto fut = info.runtime_env_process_future;
+    auto status = fut.wait_for(std::chrono::milliseconds(0));
+    if (status != std::future_status::ready) {
+      status = fut.wait_for(std::chrono::seconds(5));
+    }
+    if (status == std::future_status::ready) {
+      int code = fut.get();
+      if (code != 0) {
+        RAY_LOG(WARNING) << "[runtime_env_cleanup] ctx=" << context_tag
+                         << " helper=" << info.runtime_env_process_name
+                         << " exit_code=" << code;
+      } else {
+        RAY_LOG(DEBUG) << "[runtime_env_cleanup] ctx=" << context_tag
+                       << " helper=" << info.runtime_env_process_name << " exit_code=0";
+      }
+    } else {
+      RAY_LOG(WARNING) << "[runtime_env_cleanup] ctx=" << context_tag
+                       << " helper=" << info.runtime_env_process_name
+                       << " did not exit within timeout";
+    }
+  }
+  info.runtime_env_process_future = std::shared_future<int>();
+  info.runtime_env_process_name.clear();
+}
 
 // Helper function so tests can call TestingGetAllWorkerProcesses(*worker_pool_instance).
 std::vector<Process> TestingGetAllWorkerProcesses(const WorkerPool &pool) {

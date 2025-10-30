@@ -108,6 +108,11 @@ class RuntimeEnvAgentClient {
     virtual std::shared_future<int> StartTrackedProcess(
             const std::vector<std::string> &argv, const std::string &name) = 0;
 
+    // Register an existing process for tracking. Returns the shared future covering
+    // its asynchronous exit code observation.
+    virtual std::shared_future<int> TrackExistingProcess(
+            Process proc, const std::string &name) = 0;
+
     // Best-effort kill by name. No-op if name not found.
     virtual void KillTrackedProcess(const std::string &name) = 0;
 

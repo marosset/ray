@@ -20,6 +20,7 @@
 #include <boost/asio/io_service.hpp>
 #include <boost/functional/hash.hpp>
 #include <deque>
+#include <future>
 #include <list>
 #include <memory>
 #include <optional>
@@ -641,6 +642,10 @@ class WorkerPool : public WorkerPoolInterface {
     std::vector<std::string> dynamic_options;
     /// The duration to keep the newly created worker alive before it's assigned a lease.
     std::optional<absl::Duration> worker_startup_keep_alive_duration;
+    /// Optional handle to the runtime env helper process tracked future.
+    std::shared_future<int> runtime_env_process_future;
+    /// Identifier for the tracked helper (used for KillTrackedProcess).
+    std::string runtime_env_process_name;
   };
 
   /// An internal data structure that maintains the pool state per language.
@@ -819,9 +824,15 @@ class WorkerPool : public WorkerPoolInterface {
                         const std::chrono::high_resolution_clock::time_point &start,
                         const rpc::RuntimeEnvInfo &runtime_env_info,
                         const std::vector<std::string> &dynamic_options,
-                        std::optional<absl::Duration> worker_startup_keep_alive_duration);
+                        std::optional<absl::Duration> worker_startup_keep_alive_duration,
+                        std::string runtime_env_process_name = {},
+                        std::shared_future<int> runtime_env_process_future = {});
 
-  void RemoveWorkerProcess(State &state, const StartupToken &proc_startup_token);
+    void RemoveWorkerProcess(State &state,
+                                                     const StartupToken &proc_startup_token,
+                                                     std::string_view context_tag);
+
+    void FinalizeRuntimeEnvProcess(WorkerProcessInfo &info, std::string_view context_tag);
 
   /// Increase worker OOM scores to avoid raylet crashes from heap memory
   /// pressure.

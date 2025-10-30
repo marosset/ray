@@ -17,9 +17,11 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <future>
 #include <list>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -131,25 +133,55 @@ class MockRuntimeEnvAgentClient : public RuntimeEnvAgentClient {
     callback(true);
   };
 
-  // Mock implementations for runtime environment tracked process management.
-  // These methods provide no-op or minimal functionality since WorkerPool tests
-  // focus on worker lifecycle rather than process tracking capabilities.
-  std::shared_future<int> StartTrackedProcess(
-      const std::vector<std::string> &cmdline, const std::string &name) override {
-    // Return immediately-ready future with success exit code
-    std::promise<int> p;
-    p.set_value(0);
-    return p.get_future().share();
+  std::shared_future<int> StartTrackedProcess(const std::vector<std::string> &cmdline,
+                                              const std::string &name) override {
+    static_cast<void>(cmdline);
+    static_cast<void>(name);
+    auto fut = MakeReadyFuture(0);
+    tracked_futures_.push_back(fut);
+    return fut;
+  }
+
+  std::shared_future<int> TrackExistingProcess(Process proc,
+                                               const std::string &name) override {
+    static_cast<void>(proc);
+    tracked_process_names_.push_back(name);
+    auto fut = MakeReadyFuture(next_track_exit_code_);
+    tracked_futures_.push_back(fut);
+    return fut;
   }
 
   void KillTrackedProcess(const std::string &name) override {
-    // No-op for mock
+    killed_process_names_.push_back(name);
   }
 
-  std::string FormatTrackedProcessSummary() const override {
-    // Return empty summary for mock
-    return "";
+  std::string FormatTrackedProcessSummary() const override { return ""; }
+
+  const std::vector<std::string> &tracked_process_names() const {
+    return tracked_process_names_;
   }
+
+  const std::vector<std::string> &killed_process_names() const {
+    return killed_process_names_;
+  }
+
+  const std::vector<std::shared_future<int>> &tracked_futures() const {
+    return tracked_futures_;
+  }
+
+  void set_next_track_exit_code(int exit_code) { next_track_exit_code_ = exit_code; }
+
+ private:
+  std::shared_future<int> MakeReadyFuture(int exit_code) {
+    std::promise<int> p;
+    p.set_value(exit_code);
+    return p.get_future().share();
+  }
+
+  int next_track_exit_code_ = 0;
+  std::vector<std::string> tracked_process_names_;
+  std::vector<std::string> killed_process_names_;
+  std::vector<std::shared_future<int>> tracked_futures_;
 };
 
 class WorkerPoolMock : public WorkerPool {
@@ -486,7 +518,9 @@ class WorkerPoolTest : public ::testing::Test {
       io_service_.run();
     }));
     promise.get_future().get();
-    worker_pool_->SetRuntimeEnvAgentClient(std::make_unique<MockRuntimeEnvAgentClient>());
+    auto runtime_env_client = std::make_unique<MockRuntimeEnvAgentClient>();
+    mock_runtime_env_agent_client_ = runtime_env_client.get();
+    worker_pool_->SetRuntimeEnvAgentClient(std::move(runtime_env_client));
   }
 
   void TearDown() override {
@@ -524,6 +558,16 @@ class WorkerPoolTest : public ::testing::Test {
         io_service_, worker_commands, *mock_gcs_client_, mock_worker_rpc_clients_);
   }
 
+  WorkerPool::State &StateForLanguage(const Language &language) {
+    return worker_pool_->GetStateForLanguage(language);
+  }
+
+  void RemoveWorkerProcessForTest(const Language &language,
+                                  StartupToken token,
+                                  std::string_view context_tag) {
+    worker_pool_->RemoveWorkerProcess(StateForLanguage(language), token, context_tag);
+  }
+
   void TestStartupWorkerProcessCount(Language language, int num_workers_per_process) {
     int desired_initial_worker_process_count = 100;
     int expected_worker_process_count = static_cast<int>(std::ceil(
@@ -550,6 +594,7 @@ class WorkerPoolTest : public ::testing::Test {
       mock_worker_rpc_clients_;
 
  protected:
+  MockRuntimeEnvAgentClient *mock_runtime_env_agent_client_ = nullptr;
   instrumented_io_context io_service_;
   std::unique_ptr<std::thread> thread_io_service_;
   std::unique_ptr<WorkerPoolMock> worker_pool_;
@@ -678,6 +723,69 @@ TEST_F(WorkerPoolDriverRegisteredTest, HandleWorkerRegistration) {
     worker_pool_->DisconnectWorker(
         worker, /*disconnect_type=*/rpc::WorkerExitType::INTENDED_USER_EXIT);
     ASSERT_EQ(worker_pool_->NumWorkersStarting(), 0);
+  }
+}
+
+TEST_F(WorkerPoolDriverRegisteredTest, TracksRuntimeEnvHelperOnStart) {
+  ASSERT_NE(mock_runtime_env_agent_client_, nullptr);
+  PopWorkerStatus status = PopWorkerStatus::TooManyStartingWorkerProcesses;
+  auto runtime_env_info =
+      ExampleRuntimeEnvInfoFromString(R"({"py_modules":["pkga"]})");
+  auto [proc, token] = worker_pool_->StartWorkerProcess(
+      Language::PYTHON,
+      rpc::WorkerType::WORKER,
+      JOB_ID,
+      &status,
+      /*dynamic_options=*/{},
+      /*runtime_env_hash=*/123,
+      /*serialized_runtime_env_context=*/"{}",
+      runtime_env_info);
+  ASSERT_EQ(status, PopWorkerStatus::OK);
+  ASSERT_TRUE(proc.IsValid());
+  auto &state = StateForLanguage(Language::PYTHON);
+  auto it = state.worker_processes.find(token);
+  ASSERT_NE(it, state.worker_processes.end());
+  ASSERT_FALSE(mock_runtime_env_agent_client_->tracked_process_names().empty());
+  EXPECT_FALSE(it->second.runtime_env_process_name.empty());
+  EXPECT_EQ(mock_runtime_env_agent_client_->tracked_process_names().back(),
+            it->second.runtime_env_process_name);
+  EXPECT_TRUE(it->second.runtime_env_process_future.valid());
+  ASSERT_FALSE(mock_runtime_env_agent_client_->tracked_futures().empty());
+  EXPECT_TRUE(mock_runtime_env_agent_client_->tracked_futures().back().valid());
+  if (proc.IsValid()) {
+    proc.Kill();
+    proc.Wait();
+  }
+}
+
+TEST_F(WorkerPoolDriverRegisteredTest, RemoveWorkerProcessFinalizesRuntimeEnvHelper) {
+  ASSERT_NE(mock_runtime_env_agent_client_, nullptr);
+  mock_runtime_env_agent_client_->set_next_track_exit_code(7);
+  PopWorkerStatus status = PopWorkerStatus::RuntimeEnvCreationFailed;
+  auto runtime_env_info =
+      ExampleRuntimeEnvInfoFromString(R"({"py_modules":["pkgb"]})");
+  auto [proc, token] = worker_pool_->StartWorkerProcess(
+      Language::PYTHON,
+      rpc::WorkerType::WORKER,
+      JOB_ID,
+      &status,
+      /*dynamic_options=*/{},
+      /*runtime_env_hash=*/321,
+      /*serialized_runtime_env_context=*/"{}",
+      runtime_env_info);
+  ASSERT_EQ(status, PopWorkerStatus::OK);
+  auto &state = StateForLanguage(Language::PYTHON);
+  ASSERT_NE(state.worker_processes.find(token), state.worker_processes.end());
+  EXPECT_TRUE(mock_runtime_env_agent_client_->killed_process_names().empty());
+  RemoveWorkerProcessForTest(Language::PYTHON, token, "unit_test/remove");
+  EXPECT_EQ(state.worker_processes.find(token), state.worker_processes.end());
+  ASSERT_FALSE(mock_runtime_env_agent_client_->tracked_process_names().empty());
+  ASSERT_EQ(mock_runtime_env_agent_client_->killed_process_names().size(), 1u);
+  EXPECT_EQ(mock_runtime_env_agent_client_->killed_process_names().back(),
+            mock_runtime_env_agent_client_->tracked_process_names().back());
+  if (proc.IsValid()) {
+    proc.Kill();
+    proc.Wait();
   }
 }
 

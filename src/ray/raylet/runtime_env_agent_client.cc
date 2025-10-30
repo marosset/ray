@@ -16,15 +16,15 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <boost/beast.hpp>
 #include <boost/beast/http.hpp>
+#include <chrono>
 #include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <queue>
+#include <sstream>
 #include <string>
 #include <utility>
-#include <sstream>
-#include <chrono>
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/strings/str_format.h"
@@ -531,9 +531,10 @@ class HttpRuntimeEnvAgentClient : public RuntimeEnvAgentClient {
   const uint32_t agent_register_timeout_ms_;
   const uint32_t agent_manager_retry_interval_ms_;
 
-  // Optional tracked helper processes for runtime environment management (currently test only).
-  // Uses std::deque to ensure stable addresses for Process objects whose WaitAsync()
-  // detached threads capture `this`; vector reallocation would invalidate those pointers.
+  // Optional tracked helper processes for runtime environment management (currently only used
+  // for testing). Uses std::deque to ensure stable addresses for Process objects whose
+  // WaitAsync() detached threads capture `this`; vector reallocation would invalidate
+  // those pointers.
   std::deque<TrackedProcessEntry> tracked_processes_;
 
  public:
@@ -550,13 +551,29 @@ class HttpRuntimeEnvAgentClient : public RuntimeEnvAgentClient {
     if (!proc.IsValid() || ec) {
       RAY_LOG(ERROR) << "Failed to start tracked runtime env process '" << name
                      << "': " << ec.message();
-      std::promise<int> p; p.set_value(-1);
+      std::promise<int> p;
+      p.set_value(-1);
       auto fut = p.get_future().share();
       tracked_processes_.push_back(TrackedProcessEntry{name, Process(), fut});
       return fut;
     }
     // IMPORTANT: move the process into the vector BEFORE calling WaitAsync so the
     // detached waiter thread captures a stable Process object (avoid dangling `this`).
+    tracked_processes_.push_back(TrackedProcessEntry{name, std::move(proc), {}});
+    auto &entry = tracked_processes_.back();
+    entry.exit_future = entry.process.WaitAsync();
+    return entry.exit_future;
+  }
+
+  std::shared_future<int> TrackExistingProcess(Process proc,
+                                               const std::string &name) override {
+    if (!proc.IsValid()) {
+      std::promise<int> p;
+      p.set_value(-1);
+      auto fut = p.get_future().share();
+      tracked_processes_.push_back(TrackedProcessEntry{name, Process(), fut});
+      return tracked_processes_.back().exit_future;
+    }
     tracked_processes_.push_back(TrackedProcessEntry{name, std::move(proc), {}});
     auto &entry = tracked_processes_.back();
     entry.exit_future = entry.process.WaitAsync();
@@ -577,11 +594,16 @@ class HttpRuntimeEnvAgentClient : public RuntimeEnvAgentClient {
     out << "[";
     bool first = true;
     for (auto &tp : tracked_processes_) {
-      if (!first) out << ","; else first = false;
-      bool ready = false; int code = 0;
+      if (!first)
+        out << ",";
+      else
+        first = false;
+      bool ready = false;
+      int code = 0;
       if (tp.exit_future.valid() &&
           tp.exit_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-        ready = true; code = tp.exit_future.get();
+        ready = true;
+        code = tp.exit_future.get();
       }
       out << "{name:" << tp.name << ",ready:" << (ready ? 1 : 0);
       if (ready) out << ",exit_code:" << code;
