@@ -1,26 +1,68 @@
-// Minimal A7 aggregation test: verify summary reflects mixed ready states and fate sharing.
-#include "ray/raylet/agent_manager.h"
-#include "src/ray/protobuf/gcs.pb.h"
-#include <gtest/gtest.h>
-#include <fstream>
+// Copyright 2025 The Ray Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-using namespace ray::raylet;
+#include "ray/raylet/agent_manager.h"
+
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include "ray/common/id.h"
+#include "src/ray/protobuf/gcs.pb.h"
+
+namespace ray::raylet {
+
+// Minimal A7 aggregation test: verify summary reflects mixed ready states and fate sharing.
 
 static std::string ResolveSleepLoopPath() {
 #ifdef _WIN32
   std::string exe;
   if (const char *test_srcdir = std::getenv("TEST_SRCDIR")) {
     std::string c = std::string(test_srcdir) + "/io_ray/src/ray/util/tests/sleep_loop.exe";
-    if (std::ifstream(c).good()) exe = c;
+    if (std::ifstream(c).good()) {
+      exe = c;
+    }
   }
   if (exe.empty()) {
     std::string c = "./bazel-bin/src/ray/util/tests/sleep_loop.exe";
-    if (std::ifstream(c).good()) exe = c;
+    if (std::ifstream(c).good()) {
+      exe = c;
+    }
   }
-  if (exe.empty()) exe = "sleep_loop.exe";
+  if (exe.empty()) {
+    exe = "sleep_loop.exe";
+  }
   return exe;
 #else
-  return "sleep_loop";
+  std::vector<std::string> candidates;
+  if (const char *test_srcdir = std::getenv("TEST_SRCDIR")) {
+    candidates.emplace_back(std::string(test_srcdir) + "/io_ray/src/ray/util/tests/sleep_loop");
+  }
+  candidates.emplace_back("./bazel-bin/src/ray/util/tests/sleep_loop");
+  candidates.emplace_back("sleep_loop");
+  for (const auto &path : candidates) {
+    if (std::ifstream(path, std::ios::binary).good()) {
+      return path;
+    }
+  }
+  return candidates.back();
 #endif
 }
 
@@ -53,3 +95,5 @@ TEST(AgentManagerSummaryTest, MixedReadinessSummary) {
   // Simplicity: just ensure at least one ready:0 exists.
   EXPECT_NE(summary.find("ready:0"), std::string::npos);
 }
+
+}  // namespace ray::raylet

@@ -14,15 +14,21 @@
 
 #include "ray/raylet/agent_manager.h"
 
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
+#include <future>
+#include <memory>
+#include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
-#include "gtest/gtest.h"
+#include <gtest/gtest.h>
 #include "ray/common/id.h"
-#include "ray/util/logging.h"
 
-namespace ray { namespace raylet {
+namespace ray::raylet {
 
 // Resolve path to sleep_loop helper binary.
 static std::string ResolveSleepLoop() {
@@ -30,31 +36,55 @@ static std::string ResolveSleepLoop() {
   std::string exe;
   if (const char *test_srcdir = std::getenv("TEST_SRCDIR")) {
     std::string candidate = std::string(test_srcdir) + "/io_ray/src/ray/util/tests/sleep_loop.exe";
-    if (std::ifstream(candidate).good()) { exe = candidate; }
+    if (std::ifstream(candidate).good()) {
+      exe = candidate;
+    }
   }
   if (exe.empty()) {
     std::string candidate = "./bazel-bin/src/ray/util/tests/sleep_loop.exe";
-    if (std::ifstream(candidate).good()) { exe = candidate; }
+    if (std::ifstream(candidate).good()) {
+      exe = candidate;
+    }
   }
-  if (exe.empty()) { exe = "sleep_loop.exe"; }
+  if (exe.empty()) {
+    exe = "sleep_loop.exe";
+  }
   return exe;
 #else
-  return "sleep_loop";  // rely on runfiles
+  std::vector<std::string> candidates;
+  if (const char *test_srcdir = std::getenv("TEST_SRCDIR")) {
+    candidates.emplace_back(std::string(test_srcdir) + "/io_ray/src/ray/util/tests/sleep_loop");
+  }
+  candidates.emplace_back("./bazel-bin/src/ray/util/tests/sleep_loop");
+  candidates.emplace_back("sleep_loop");
+  for (const auto &path : candidates) {
+    if (std::ifstream(path, std::ios::binary).good()) {
+      return path;
+    }
+  }
+  return candidates.back();
 #endif
 }
 
 // Simple no-op delay executor used in tests WITHOUT fate sharing.
 // (Fate-sharing tests below use RecordedDelayExecutor to observe scheduled QuickExit.)
 static DelayExecutorFn NoopDelayExecutor() {
-  return [](std::function<void()> fn, uint32_t ms) -> std::shared_ptr<boost::asio::deadline_timer> {
-    (void)fn; (void)ms; return nullptr; };
+  return [](std::function<void()> fn, uint32_t ms)
+             -> std::shared_ptr<boost::asio::deadline_timer> {
+    (void)fn;
+    (void)ms;
+    return nullptr;
+  };
 }
 
 TEST(AgentManagerTest, NaturalExitPublishesFuture) {
-  std::vector<std::string> cmd{ResolveSleepLoop(), "--millis=500"}; // 0.5s
-  AgentManager::Options opts{NodeID::FromRandom(), "test_agent", cmd, /*fate_shares=*/false};
+  std::vector<std::string> cmd{ResolveSleepLoop(), "--millis=500"};  // 0.5s
+  AgentManager::Options opts{ray::NodeID::FromRandom(), "test_agent", cmd, /*fate_shares=*/false};
   bool shutdown_called = false;
-  AgentManager mgr(opts, NoopDelayExecutor(), [&](const rpc::NodeDeathInfo &){ shutdown_called = true; }, true);
+  AgentManager mgr(opts,
+                   NoopDelayExecutor(),
+                   [&](const ray::rpc::NodeDeathInfo &) { shutdown_called = true; },
+                   true);
   auto fut = TestingGetAgentExitFuture(mgr);
   ASSERT_TRUE(fut.valid());
   // Should become ready within a few seconds.
@@ -65,10 +95,15 @@ TEST(AgentManagerTest, NaturalExitPublishesFuture) {
 }
 
 TEST(AgentManagerTest, KillTriggersFutureReadiness) {
-  std::vector<std::string> cmd{ResolveSleepLoop(), "--millis=5000"}; // long running, we'll kill
-  AgentManager::Options opts{NodeID::FromRandom(), "test_agent_kill", cmd, /*fate_shares=*/false};
+  std::vector<std::string> cmd{ResolveSleepLoop(), "--millis=5000"};  // long running, we'll kill
+  AgentManager::Options opts{ray::NodeID::FromRandom(), "test_agent_kill", cmd, /*fate_shares=*/false};
   bool shutdown_called = false;
-  auto mgr = std::make_unique<AgentManager>(opts, NoopDelayExecutor(), [&](const rpc::NodeDeathInfo &){ shutdown_called = true; }, true);
+  auto mgr = std::make_unique<AgentManager>(opts,
+                                            NoopDelayExecutor(),
+                                            [&](const ray::rpc::NodeDeathInfo &) {
+                                              shutdown_called = true;
+                                            },
+                                            true);
   auto fut = TestingGetAgentExitFuture(*mgr);
   ASSERT_TRUE(fut.valid());
   // Not expected to be ready immediately.
@@ -98,13 +133,15 @@ struct RecordedDelayExecutor {
 
 TEST(AgentManagerTest, FateShareNaturalExitTriggersShutdown) {
   std::vector<std::string> cmd{ResolveSleepLoop(), "--millis=200"};
-  AgentManager::Options opts{NodeID::FromRandom(), "fate_share_agent", cmd, /*fate_shares=*/true};
+  AgentManager::Options opts{ray::NodeID::FromRandom(), "fate_share_agent", cmd, /*fate_shares=*/true};
   std::atomic<bool> shutdown_called{false};
   auto recorder = std::make_shared<RecordedDelayExecutor>();
   {
     AgentManager mgr(opts,
                      recorder->Make(),
-                     [&](const rpc::NodeDeathInfo &){ shutdown_called.store(true, std::memory_order_relaxed); },
+                     [&](const ray::rpc::NodeDeathInfo &) {
+                       shutdown_called.store(true, std::memory_order_relaxed);
+                     },
                      true);
     auto fut = TestingGetAgentExitFuture(mgr);
     ASSERT_TRUE(fut.valid());
@@ -125,14 +162,17 @@ TEST(AgentManagerTest, FateShareNaturalExitTriggersShutdown) {
 
 TEST(AgentManagerTest, FateShareDisabledOnDestructorKill) {
   std::vector<std::string> cmd{ResolveSleepLoop(), "--millis=5000"};
-  AgentManager::Options opts{NodeID::FromRandom(), "fate_share_kill_agent", cmd, /*fate_shares=*/true};
+  AgentManager::Options opts{ray::NodeID::FromRandom(), "fate_share_kill_agent", cmd, /*fate_shares=*/true};
   std::atomic<bool> shutdown_called{false};
   auto recorder = std::make_shared<RecordedDelayExecutor>();
   std::shared_future<int> fut;
   {
     auto mgr = std::make_unique<AgentManager>(opts,
                                               recorder->Make(),
-                                              [&](const rpc::NodeDeathInfo &){ shutdown_called.store(true, std::memory_order_relaxed); },
+                                              [&](const ray::rpc::NodeDeathInfo &) {
+                                                shutdown_called.store(true,
+                                                                       std::memory_order_relaxed);
+                                              },
                                               true);
     fut = TestingGetAgentExitFuture(*mgr);
     ASSERT_TRUE(fut.valid());
@@ -146,4 +186,4 @@ TEST(AgentManagerTest, FateShareDisabledOnDestructorKill) {
   EXPECT_FALSE(recorder->scheduled.load(std::memory_order_relaxed));
 }
 
-}} // namespace ray::raylet
+}  // namespace ray::raylet
