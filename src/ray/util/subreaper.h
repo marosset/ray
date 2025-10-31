@@ -19,6 +19,7 @@
 #include <sys/types.h>
 
 #include <boost/asio.hpp>
+#include <atomic>
 #include <functional>
 #include <optional>
 #include <vector>
@@ -131,6 +132,9 @@ class ProcessExitCallbackRegistry {
     std::function<void(int)> fn;
   };
 
+  void Enable();
+  bool IsEnabled() const;
+
   std::optional<int> Register(pid_t pid,
                               boost::asio::io_context *io_ctx,
                               std::function<void(int)> callback);
@@ -145,6 +149,7 @@ class ProcessExitCallbackRegistry {
   absl::Mutex m_;
   absl::flat_hash_map<pid_t, std::vector<CallbackEntry>> callbacks_ ABSL_GUARDED_BY(m_);
   absl::flat_hash_map<pid_t, int> completed_ ABSL_GUARDED_BY(m_);
+  std::atomic<bool> enabled_{false};
 };
 
 std::optional<int> RegisterProcessExitCallback(pid_t pid,

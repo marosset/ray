@@ -31,6 +31,10 @@
 #include <unistd.h>
 #endif
 
+#ifdef __linux__
+#include <boost/asio/io_context.hpp>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -211,7 +215,7 @@ class ProcessFD {
     int parent_lifetime_pipe[2];
 
     if (decouple) {
-      // TODO: On modern Linux (>=5.3) replace this lifetime pipe +
+      // TODO(marosset): On modern Linux (>=5.3) replace this lifetime pipe +
       // double-fork approach with pidfd_open() (and possibly pidfd_send_signal()) so
       // we can (1) avoid the second fork, (2) poll() or epoll() directly on the pidfd,
       // and (3) obtain the real exit status of decoupled processes instead of defaulting
@@ -393,23 +397,34 @@ Process::~Process() {}
 // Default constructed (null) process conceptually represents an already-invalid handle;
 // treat it as having a terminal exit code of -1 so async queries can be satisfied
 // immediately without spawning waiter threads.
-Process::Process() : p_(nullptr), state_(std::make_shared<ProcessState>(-1)) {}
+Process::Process()
+    : p_(nullptr), state_(std::make_shared<ProcessState>(-1)), io_service_hint_(nullptr),
+      owns_child_(false) {}
 
-Process::Process(const Process &other) : p_(other.p_), state_(other.state_) {}
+Process::Process(const Process &other)
+    : p_(other.p_), state_(other.state_), io_service_hint_(other.io_service_hint_),
+      owns_child_(other.owns_child_) {}
 
 Process::Process(Process &&other) noexcept
-    : p_(std::move(other.p_)), state_(std::move(other.state_)) {
+    : p_(std::move(other.p_)), state_(std::move(other.state_)),
+      io_service_hint_(other.io_service_hint_), owns_child_(other.owns_child_) {
   if (!state_) {
     state_ = std::make_shared<ProcessState>(-1);
   }
   if (!other.state_) {
     other.state_ = std::make_shared<ProcessState>(-1);
   }
+  other.io_service_hint_ = nullptr;
+  other.owns_child_ = false;
 }
 
 Process &Process::operator=(Process other) {
   p_ = std::move(other.p_);
   state_ = std::move(other.state_);
+  io_service_hint_ = other.io_service_hint_;
+  owns_child_ = other.owns_child_;
+  other.io_service_hint_ = nullptr;
+  other.owns_child_ = false;
   if (!state_) {
     state_ = std::make_shared<ProcessState>(-1);
   }
@@ -419,7 +434,9 @@ Process &Process::operator=(Process other) {
   return *this;
 }
 
-Process::Process(pid_t pid) : p_(nullptr), state_(std::make_shared<ProcessState>()) {
+Process::Process(pid_t pid)
+    : p_(nullptr), state_(std::make_shared<ProcessState>()), io_service_hint_(nullptr),
+      owns_child_(false) {
   p_ = std::make_shared<ProcessFD>(pid);
   if (pid < 0) {
     // Dummy process (placeholder) — treat as already successfully exited (0).
@@ -433,14 +450,15 @@ Process::Process(const char *argv[],
                  bool decouple,
                  const ProcessEnvironment &env,
                  bool pipe_to_stdin)
-    : p_(nullptr), state_(std::make_shared<ProcessState>()) {
+    : p_(nullptr), state_(std::make_shared<ProcessState>()),
+      io_service_hint_(io_service), owns_child_(false) {
   /// TODO: use io_service with boost asio notify_fork.
-  (void)io_service;
 #ifdef __linux__
   KnownChildrenTracker::instance().AddKnownChild([&, this]() -> pid_t {
     ProcessFD procfd = ProcessFD::spawnvpe(argv, ec, decouple, env, pipe_to_stdin);
     if (!ec) {
       this->p_ = std::make_shared<ProcessFD>(std::move(procfd));
+      this->owns_child_ = !decouple;
     }
     return this->GetId();
   });
@@ -448,6 +466,7 @@ Process::Process(const char *argv[],
   ProcessFD procfd = ProcessFD::spawnvpe(argv, ec, decouple, env, pipe_to_stdin);
   if (!ec) {
     p_ = std::make_shared<ProcessFD>(std::move(procfd));
+    owns_child_ = !decouple;
   }
 #endif
 }
@@ -548,19 +567,30 @@ std::shared_future<int> Process::WaitAsync() {
   }
 
   if (spawn_waiter) {
-    // Launch detached waiter thread to perform blocking wait and fulfill promise.
-    Process copy = *this;  // Shares ProcessState so async wait survives caller scope exit.
-    std::thread([copy = std::move(copy)]() mutable {
-      int code = copy.DoWait();  // Direct OS wait, bypasses future check.
-      auto promise = copy.state_->exit_code_promise;
-      if (promise) {
-        try {
-          // set_value may throw on double set; ignore.
-          promise->set_value(code);
-        } catch (...) {
-        }
+    bool handled_without_thread = false;
+#ifdef __linux__
+    if (CanRegisterForLinuxAsyncWait()) {
+      Process callback_process = *this;
+      pid_t pid = callback_process.GetId();
+      auto maybe_exit = RegisterProcessExitCallback(
+          pid,
+          static_cast<boost::asio::io_context *>(io_service_hint_),
+          [proc = std::move(callback_process), pid](int exit_code) mutable {
+            proc.PublishExitCode(exit_code);
+            RemoveProcessExitCallback(pid);
+          });
+      if (maybe_exit.has_value()) {
+        PublishExitCode(*maybe_exit);
+        RemoveProcessExitCallback(pid);
       }
-    }).detach();
+      handled_without_thread = true;
+    }
+#endif
+    if (!handled_without_thread) {
+      // Launch detached waiter thread to perform blocking wait and fulfill promise.
+      Process copy = *this;  // Shares ProcessState so async wait survives caller scope exit.
+      std::thread([copy = std::move(copy)]() mutable { copy.DoWait(); }).detach();
+    }
   }
 
   return state_->exit_code_future;
@@ -585,6 +615,46 @@ std::pair<Process, std::error_code> Process::Spawn(const std::vector<std::string
   }
   return std::make_pair(std::move(proc), error);
 }
+
+int Process::PublishExitCode(int exit_code) const {
+  int expected = kStillRunning;
+  if (!state_->exit_code.compare_exchange_strong(expected,
+                                                 exit_code,
+                                                 std::memory_order_acq_rel)) {
+    exit_code = expected;
+  } else if (state_->exit_code_promise) {
+    try {
+      state_->exit_code_promise->set_value(exit_code);
+    } catch (...) {
+      // Ignore promise errors (double publish, broken), consumers already have result.
+    }
+  }
+  return exit_code;
+}
+
+#ifdef __linux__
+bool Process::CanRegisterForLinuxAsyncWait() const {
+  if (!ProcessExitCallbackRegistry::instance().IsEnabled()) {
+    return false;
+  }
+  if (!owns_child_) {
+    return false;
+  }
+  if (!p_) {
+    return false;
+  }
+  if (io_service_hint_ == nullptr) {
+    return false;
+  }
+  if (p_->GetId() < 0) {
+    return false;
+  }
+  if (p_->GetFD() != -1) {
+    return false;
+  }
+  return true;
+}
+#endif
 
 int Process::DoWait() const {
   // Internal wait implementation that directly waits on OS primitives.
@@ -646,20 +716,7 @@ int Process::DoWait() const {
     }
   }
 
-  // Attempt to publish result (single-writer expected). If another thread beat us,
-  // prefer the published value.
-  int expected = kStillRunning;
-  if (!state_->exit_code.compare_exchange_strong(expected, result,
-                                                 std::memory_order_acq_rel)) {
-    result = expected;  // someone else set it; use that value
-  } else if (state_->exit_code_promise) {
-    try {
-      state_->exit_code_promise->set_value(result);
-    } catch (...) {
-      // Ignore double-set or broken promise.
-    }
-  }
-  return result;
+  return PublishExitCode(result);
 }
 
 int Process::Wait() const {

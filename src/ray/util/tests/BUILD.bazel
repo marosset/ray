@@ -8,6 +8,14 @@ cc_binary(
     deps = [],
 )
 
+cc_binary(
+    name = "exit_with_code",
+    srcs = ["exit_with_code.cc"],
+    visibility = ["//visibility:public"],
+    tags = ["manual"],  # helper binary for deterministic exit codes
+    deps = [],
+)
+
 ray_cc_test(
     name = "array_test",
     srcs = ["array_test.cc"],
@@ -174,7 +182,10 @@ ray_cc_test(
     name = "process_test",
     size = "small",
     srcs = ["process_test.cc"],
-    data = ["//src/ray/util/tests:sleep_loop"],
+    data = [
+        "//src/ray/util/tests:exit_with_code",
+        "//src/ray/util/tests:sleep_loop",
+    ],
     tags = ["team:core"],
     deps = [
         "//src/ray/util:process",

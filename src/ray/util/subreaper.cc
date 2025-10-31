@@ -101,6 +101,7 @@ void SetupSigchldHandlerRemoveKnownChildren(boost::asio::io_context &io_service)
   auto sigchld_signals = std::make_shared<boost::asio::signal_set>(io_service, SIGCHLD);
   RegisterSignalHandlerLoop(sigchld_signals,
                             SigchldHandlerReapZombieAndRemoveKnownChildren);
+  ProcessExitCallbackRegistry::instance().Enable();
   RAY_LOG(INFO)
       << "Raylet is set to reap zombie children and remove known children pids.";
 }
@@ -170,6 +171,12 @@ std::vector<pid_t> KnownChildrenTracker::ListUnknownChildren(
 ProcessExitCallbackRegistry &ProcessExitCallbackRegistry::instance() {
   static ProcessExitCallbackRegistry instance;
   return instance;
+}
+
+void ProcessExitCallbackRegistry::Enable() { enabled_.store(true, std::memory_order_release); }
+
+bool ProcessExitCallbackRegistry::IsEnabled() const {
+  return enabled_.load(std::memory_order_acquire);
 }
 
 std::optional<int> ProcessExitCallbackRegistry::Register(

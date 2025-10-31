@@ -175,6 +175,15 @@ class Process {
   /// Used by both Wait() and the WaitAsync() detached thread.
   /// Should not be called directly if WaitAsync() has already been invoked.
   int DoWait() const;
+
+  int PublishExitCode(int exit_code) const;
+
+#ifdef __linux__
+  bool CanRegisterForLinuxAsyncWait() const;
+#endif
+
+  void *io_service_hint_ = nullptr;
+  bool owns_child_ = false;
 };
 
 // Get the Process ID of the parent process. If the parent process exits, the PID

@@ -28,32 +28,15 @@
 #include <vector>
 
 #include "ray/util/logging.h"
+#include "ray/util/subreaper.h"
+
+#ifdef __linux__
+#include <boost/asio/io_context.hpp>
+#endif
 
 namespace ray {
 
 namespace {
-
-std::vector<std::string> MakeExitCommandArgs(int exit_code, bool delayed) {
-  std::vector<std::string> args;
-#ifdef _WIN32
-  std::string command;
-  if (delayed) {
-    command = "timeout /T 1 /NOBREAK >NUL & exit " + std::to_string(exit_code);
-  } else {
-    command = "exit " + std::to_string(exit_code);
-  }
-  args = {"cmd.exe", "/C", command};
-#else
-  std::string command;
-  if (delayed) {
-    command = "sleep 1; exit " + std::to_string(exit_code);
-  } else {
-    command = "exit " + std::to_string(exit_code);
-  }
-  args = {"bash", "-c", command};
-#endif
-  return args;
-}
 
 std::string ResolveSleepLoopExecutable() {
 #ifdef _WIN32
@@ -81,6 +64,38 @@ std::vector<std::string> MakeSleepLoopArgs(int millis) {
   std::vector<std::string> args;
   args.emplace_back(ResolveSleepLoopExecutable());
   args.emplace_back("--millis=" + std::to_string(millis));
+  return args;
+}
+
+std::string ResolveExitWithCodeExecutable() {
+#ifdef _WIN32
+  const char *binary_name = "exit_with_code.exe";
+#else
+  const char *binary_name = "exit_with_code";
+#endif
+  std::vector<std::string> candidates;
+  if (const char *test_srcdir = std::getenv("TEST_SRCDIR")) {
+    candidates.emplace_back(std::string(test_srcdir) + "/io_ray/src/ray/util/tests/" +
+                            binary_name);
+  }
+  candidates.emplace_back("./bazel-bin/src/ray/util/tests/" + std::string(binary_name));
+  candidates.emplace_back(binary_name);
+  for (const auto &path : candidates) {
+    std::ifstream f(path, std::ios::binary);
+    if (f.good()) {
+      return path;
+    }
+  }
+  return candidates.back();
+}
+
+std::vector<std::string> MakeExitCommandArgs(int exit_code, bool delayed) {
+  std::vector<std::string> args;
+  args.emplace_back(ResolveExitWithCodeExecutable());
+  args.emplace_back("--code=" + std::to_string(exit_code));
+  if (delayed) {
+    args.emplace_back("--delay-ms=1000");
+  }
   return args;
 }
 
@@ -138,13 +153,13 @@ TEST(UtilTest, GetAllProcsWithPpid) {
 
 TEST(UtilTest, ProcessExitCode) {
   Process proc = Process::CreateNewDummy();
-  //dummy process exit code is immediately 0.
+  // dummy process exit code is immediately 0.
   ASSERT_EQ(proc.ExitCode(), 0);
 }
 
 TEST(UtilTest, ProcessWaitCapturesExitCode) {
   // Spawn a simple process that exits with code 0 (bash -c 'exit 0').
-  std::vector<std::string> args = {"bash", "-c", "exit 0"};
+  auto args = MakeExitCommandArgs(0, /*delayed=*/false);
   auto pair = Process::Spawn(args, /*decouple*/ false);
   ASSERT_FALSE(pair.second) << pair.second.message();
   Process &proc = pair.first;
@@ -185,7 +200,7 @@ TEST(UtilTest, WindowsKillExitCodeIsErrorProcessAborted) {
 #endif
 
 TEST(UtilTest, ProcessWaitIdempotent) {
-  std::vector<std::string> args = {"bash", "-c", "exit 7"};
+  auto args = MakeExitCommandArgs(7, /*delayed=*/false);
   auto pair = Process::Spawn(args, /*decouple*/ false);
   ASSERT_FALSE(pair.second) << pair.second.message();
   Process &proc = pair.first;
@@ -267,7 +282,7 @@ TEST(UtilTest, SpawnWritesPidFile) {
 }
 
 TEST(UtilTest, WaitAsyncReturnsReadyFutureIfAlreadyExited) {
-  std::vector<std::string> args = {"bash", "-c", "exit 42"};
+  auto args = MakeExitCommandArgs(42, /*delayed=*/false);
   auto pair = Process::Spawn(args, /*decouple*/ false);
   ASSERT_FALSE(pair.second) << pair.second.message();
   Process &proc = pair.first;
@@ -280,7 +295,7 @@ TEST(UtilTest, WaitAsyncReturnsReadyFutureIfAlreadyExited) {
 }
 
 TEST(UtilTest, WaitAsyncBasicCompletion) {
-  std::vector<std::string> args = {"bash", "-c", "sleep 1; exit 3"};
+  auto args = MakeExitCommandArgs(3, /*delayed=*/true);
   auto pair = Process::Spawn(args, /*decouple*/ false);
   ASSERT_FALSE(pair.second) << pair.second.message();
   Process &proc = pair.first;
@@ -298,7 +313,7 @@ TEST(UtilTest, WaitAsyncBasicCompletion) {
 }
 
 TEST(UtilTest, WaitAsyncMultipleConsumersShareSameFuture) {
-  std::vector<std::string> args = {"bash", "-c", "sleep 1; exit 5"};
+  auto args = MakeExitCommandArgs(5, /*delayed=*/true);
   auto pair = Process::Spawn(args, /*decouple*/ false);
   ASSERT_FALSE(pair.second) << pair.second.message();
   Process &proc = pair.first;
@@ -338,7 +353,7 @@ TEST(UtilTest, WaitAsyncKillPath) {
 }
 
 TEST(UtilTest, WaitAsyncIdempotentFutureReference) {
-  std::vector<std::string> args = {"bash", "-c", "exit 9"};
+  auto args = MakeExitCommandArgs(9, /*delayed=*/false);
   auto pair = Process::Spawn(args, /*decouple*/ false);
   ASSERT_FALSE(pair.second) << pair.second.message();
   Process &proc = pair.first;
@@ -352,7 +367,7 @@ TEST(UtilTest, WaitAsyncIdempotentFutureReference) {
 }
 
 TEST(UtilTest, WaitAsyncSyncAfterAsync) {
-  std::vector<std::string> args = {"bash", "-c", "sleep 1; exit 11"};
+  auto args = MakeExitCommandArgs(11, /*delayed=*/true);
   auto pair = Process::Spawn(args, /*decouple*/ false);
   ASSERT_FALSE(pair.second) << pair.second.message();
   Process &proc = pair.first;
@@ -405,6 +420,39 @@ TEST(UtilTest, WaitAsyncProcessAlreadyExitedWithoutPriorWait) {
   ASSERT_EQ(proc.ExitCode(), 0);
   ASSERT_EQ(proc.Wait(), 0);
 }
+
+#ifdef __linux__
+TEST(UtilTest, WaitAsyncPostsToIoContextWhenProvided) {
+  boost::asio::io_context io_context;
+  SetupSigchldHandlerRemoveKnownChildren(io_context);
+
+  const char *argv[] = {"bash", "-c", "sleep 0.1; exit 23", nullptr};
+  std::error_code ec;
+  Process proc(argv, &io_context, ec, /*decouple=*/false, ProcessEnvironment{});
+  ASSERT_FALSE(ec) << ec.message();
+  ASSERT_TRUE(proc.IsValid());
+
+  auto fut = proc.WaitAsync();
+  ASSERT_TRUE(fut.valid());
+  EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+
+  for (int i = 0; i < 100; ++i) {
+    io_context.poll();
+    if (fut.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  io_context.poll();
+
+  ASSERT_EQ(fut.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+  EXPECT_EQ(fut.get(), 23);
+  EXPECT_EQ(proc.Wait(), 23);
+
+  io_context.stop();
+  io_context.poll();
+}
+#endif
 
 TEST(UtilTest, WaitAsyncFutureSurvivesProcessScope) {
   const int expected = 0;
@@ -465,18 +513,18 @@ TEST(UtilTest, WaitAsyncThenKillNoDoubleWait) {
   auto pair = Process::Spawn(args, /*decouple*/ false);
   ASSERT_FALSE(pair.second) << pair.second.message();
   Process &proc = pair.first;
-  
+
   // Call WaitAsync first, spawning the detached waiter thread
   auto fut = proc.WaitAsync();
   ASSERT_TRUE(fut.valid());
-  
+
   // Give the waiter thread a brief moment to start waiting
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  
+
   // Now kill the process. This internally calls Wait(), which must NOT
   // try to wait on the OS handle again (would fail on Windows).
   proc.Kill();
-  
+
   // Future should become ready with killed exit code
   fut.wait();
   int code = fut.get();
@@ -485,10 +533,10 @@ TEST(UtilTest, WaitAsyncThenKillNoDoubleWait) {
 #else
   ASSERT_NE(code, kStillRunning);
 #endif
-  
+
   // ExitCode should be updated
   ASSERT_EQ(proc.ExitCode(), code);
-  
+
   // Additional Wait() calls should return cached value without error
   ASSERT_EQ(proc.Wait(), code);
 }
@@ -500,9 +548,9 @@ TEST(UtilTest, MultipleWaitCallsWhileWaitAsyncActive) {
   auto pair = Process::Spawn(args, /*decouple*/ false);
   ASSERT_FALSE(pair.second) << pair.second.message();
   Process &proc = pair.first;
-  
+
   auto fut = proc.WaitAsync();
-  
+
   // Spawn multiple threads that all call Wait()
   std::vector<std::thread> waiters;
   std::vector<int> results(3, kStillRunning);
@@ -511,16 +559,16 @@ TEST(UtilTest, MultipleWaitCallsWhileWaitAsyncActive) {
       results[i] = proc.Wait();
     });
   }
-  
+
   // Wait for all threads to complete
   for (auto &t : waiters) {
     t.join();
   }
-  
+
   fut.wait();
   int expected = fut.get();
   ASSERT_EQ(expected, 13);
-  
+
   // All Wait() calls should have returned the same exit code
   for (int i = 0; i < 3; ++i) {
     ASSERT_EQ(results[i], expected);
