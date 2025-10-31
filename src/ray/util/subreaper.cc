@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #ifdef __linux__
@@ -67,13 +68,17 @@ void SigchldHandlerReapZombieAndRemoveKnownChildren(
   // Reaps any children that have exited. WNOHANG makes waitpid non-blocking and returns
   // 0 if there's no zombie children.
   while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+    int normalized_exit = -1;
     if (WIFEXITED(status)) {
+      normalized_exit = WEXITSTATUS(status);
       RAY_LOG(INFO) << "Child process " << pid << " exited with status "
-                    << WEXITSTATUS(status);
+                    << normalized_exit;
     } else if (WIFSIGNALED(status)) {
+      normalized_exit = 128 + WTERMSIG(status);
       RAY_LOG(INFO) << "Child process " << pid << " exited from signal "
                     << WTERMSIG(status);
     }
+    ProcessExitCallbackRegistry::instance().Notify(pid, normalized_exit);
     KnownChildrenTracker::instance().RemoveKnownChild(pid);
   }
 }
@@ -160,6 +165,69 @@ std::vector<pid_t> KnownChildrenTracker::ListUnknownChildren(
     }
   }
   return result;
+}
+
+ProcessExitCallbackRegistry &ProcessExitCallbackRegistry::instance() {
+  static ProcessExitCallbackRegistry instance;
+  return instance;
+}
+
+std::optional<int> ProcessExitCallbackRegistry::Register(
+    pid_t pid, boost::asio::io_context *io_ctx, std::function<void(int)> callback) {
+  absl::MutexLock lock(&m_);
+  auto completed_it = completed_.find(pid);
+  if (completed_it != completed_.end()) {
+    int exit_code = completed_it->second;
+    completed_.erase(completed_it);
+    return exit_code;
+  }
+  callbacks_[pid].push_back(CallbackEntry{io_ctx, std::move(callback)});
+  return std::nullopt;
+}
+
+void ProcessExitCallbackRegistry::Remove(pid_t pid) {
+  absl::MutexLock lock(&m_);
+  callbacks_.erase(pid);
+  completed_.erase(pid);
+}
+
+void ProcessExitCallbackRegistry::Notify(pid_t pid, int exit_code) {
+  std::vector<CallbackEntry> entries;
+  {
+    absl::MutexLock lock(&m_);
+    auto it = callbacks_.find(pid);
+    if (it != callbacks_.end()) {
+      entries = std::move(it->second);
+      callbacks_.erase(it);
+    } else {
+      completed_[pid] = exit_code;
+      return;
+    }
+  }
+
+  for (auto &entry : entries) {
+    if (!entry.fn) {
+      continue;
+    }
+    if (entry.io_ctx) {
+      entry.io_ctx->post([fn = std::move(entry.fn), exit_code]() mutable {
+        fn(exit_code);
+      });
+    } else {
+      entry.fn(exit_code);
+    }
+  }
+}
+
+std::optional<int> RegisterProcessExitCallback(pid_t pid,
+                                               boost::asio::io_context *io_ctx,
+                                               std::function<void(int)> callback) {
+  return ProcessExitCallbackRegistry::instance().Register(pid, io_ctx,
+                                                          std::move(callback));
+}
+
+void RemoveProcessExitCallback(pid_t pid) {
+  ProcessExitCallbackRegistry::instance().Remove(pid);
 }
 
 #elif defined(_WIN32)

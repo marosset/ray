@@ -19,8 +19,11 @@
 #include <sys/types.h>
 
 #include <boost/asio.hpp>
+#include <functional>
+#include <optional>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/synchronization/mutex.h"
 #include "ray/util/macros.h"
@@ -117,6 +120,38 @@ class KnownChildrenTracker {
   absl::Mutex m_;
   absl::flat_hash_set<pid_t> children_ ABSL_GUARDED_BY(m_);
 };
+
+// Registry that stores per-pid exit callbacks to be invoked from the SIGCHLD handler.
+class ProcessExitCallbackRegistry {
+ public:
+  static ProcessExitCallbackRegistry &instance();
+
+  struct CallbackEntry {
+    boost::asio::io_context *io_ctx;
+    std::function<void(int)> fn;
+  };
+
+  std::optional<int> Register(pid_t pid,
+                              boost::asio::io_context *io_ctx,
+                              std::function<void(int)> callback);
+
+  void Remove(pid_t pid);
+
+  void Notify(pid_t pid, int exit_code);
+
+ private:
+  ProcessExitCallbackRegistry() = default;
+
+  absl::Mutex m_;
+  absl::flat_hash_map<pid_t, std::vector<CallbackEntry>> callbacks_ ABSL_GUARDED_BY(m_);
+  absl::flat_hash_map<pid_t, int> completed_ ABSL_GUARDED_BY(m_);
+};
+
+std::optional<int> RegisterProcessExitCallback(pid_t pid,
+                                               boost::asio::io_context *io_ctx,
+                                               std::function<void(int)> callback);
+
+void RemoveProcessExitCallback(pid_t pid);
 
 #endif
 

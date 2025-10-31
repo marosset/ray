@@ -184,6 +184,21 @@ ray_cc_test(
 )
 
 ray_cc_test(
+    name = "subreaper_test",
+    size = "small",
+    srcs = ["subreaper_test.cc"],
+    tags = [
+        "no_windows",
+        "team:core",
+    ],
+    deps = [
+        "//src/ray/util:process",
+        "@boost//:asio",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+ray_cc_test(
     name = "network_util_test",
     size = "small",
     srcs = ["network_util_test.cc"],
