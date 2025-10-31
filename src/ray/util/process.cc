@@ -38,6 +38,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <mutex>
 #include <memory>
 #include <string>
 #include <utility>
@@ -69,6 +70,15 @@ int execvpe(const char *program, char *const argv[], char *const envp[]) {
 #endif
 
 namespace ray {
+
+struct ProcessState {
+  explicit ProcessState(int initial_exit = kStillRunning) : exit_code(initial_exit) {}
+
+  std::atomic<int> exit_code;
+  std::mutex wait_async_mu;
+  std::shared_future<int> exit_code_future;
+  std::shared_ptr<std::promise<int>> exit_code_promise;
+};
 
 #if !defined(_WIN32)
 void SetFdCloseOnExec(int fd) {
@@ -380,37 +390,40 @@ intptr_t ProcessFD::GetFD() const { return fd_; }
 pid_t ProcessFD::GetId() const { return pid_; }
 
 Process::~Process() {}
-// Default constructed (null) process conceptually represents an already-invalid
-// handle; treat it as having a terminal exit code of -1 so async queries can be
-// satisfied immediately without spawning waiter threads.
-// NOTE: exit_code_ atomic default initializes to kStillRunning; we override here.
-// (We can't assign directly in the member declaration because we want the special
-// sentinel for spawned processes but immediate readiness for null/dummy.)
-// This relies on the compiler generating code after the atomic's default ctor.
-Process::Process() : exit_code_promise_(nullptr) { exit_code_.store(-1, std::memory_order_release); }
+// Default constructed (null) process conceptually represents an already-invalid handle;
+// treat it as having a terminal exit code of -1 so async queries can be satisfied
+// immediately without spawning waiter threads.
+Process::Process() : p_(nullptr), state_(std::make_shared<ProcessState>(-1)) {}
 
-Process::Process(const Process &other)
-    : p_(other.p_),
-      exit_code_(other.exit_code_.load()),
-      exit_code_promise_(other.exit_code_promise_) {}
+Process::Process(const Process &other) : p_(other.p_), state_(other.state_) {}
 
 Process::Process(Process &&other) noexcept
-    : p_(std::move(other.p_)),
-      exit_code_(other.exit_code_.load()),
-      exit_code_promise_(std::move(other.exit_code_promise_)) {}
+    : p_(std::move(other.p_)), state_(std::move(other.state_)) {
+  if (!state_) {
+    state_ = std::make_shared<ProcessState>(-1);
+  }
+  if (!other.state_) {
+    other.state_ = std::make_shared<ProcessState>(-1);
+  }
+}
 
 Process &Process::operator=(Process other) {
   p_ = std::move(other.p_);
-  exit_code_ = other.exit_code_.load();
-  exit_code_promise_ = std::move(other.exit_code_promise_);
+  state_ = std::move(other.state_);
+  if (!state_) {
+    state_ = std::make_shared<ProcessState>(-1);
+  }
+  if (!other.state_) {
+    other.state_ = std::make_shared<ProcessState>(-1);
+  }
   return *this;
 }
 
-Process::Process(pid_t pid) : exit_code_promise_(nullptr) {
+Process::Process(pid_t pid) : p_(nullptr), state_(std::make_shared<ProcessState>()) {
   p_ = std::make_shared<ProcessFD>(pid);
   if (pid < 0) {
     // Dummy process (placeholder) — treat as already successfully exited (0).
-    exit_code_.store(0, std::memory_order_release);
+    state_->exit_code.store(0, std::memory_order_release);
   }
 }
 
@@ -420,7 +433,7 @@ Process::Process(const char *argv[],
                  bool decouple,
                  const ProcessEnvironment &env,
                  bool pipe_to_stdin)
-    : exit_code_promise_(nullptr) {
+    : p_(nullptr), state_(std::make_shared<ProcessState>()) {
   /// TODO: use io_service with boost asio notify_fork.
   (void)io_service;
 #ifdef __linux__
@@ -494,61 +507,63 @@ bool Process::IsNull() const { return !p_; }
 
 bool Process::IsValid() const { return GetId() != -1; }
 
-int Process::ExitCode() const { return exit_code_.load(std::memory_order_acquire); }
+int Process::ExitCode() const {
+  return state_ ? state_->exit_code.load(std::memory_order_acquire) : -1;
+}
 
 std::shared_future<int> Process::WaitAsync() {
   // Fast path: previously created future.
   {
-    std::lock_guard<std::mutex> lk(wait_async_mu_);
-    if (exit_code_future_.valid()) {
-      return exit_code_future_;
+    std::lock_guard<std::mutex> lk(state_->wait_async_mu);
+    if (state_->exit_code_future.valid()) {
+      return state_->exit_code_future;
     }
   }
 
-  int cached = exit_code_.load(std::memory_order_acquire);
+  int cached = state_->exit_code.load(std::memory_order_acquire);
   if (cached != kStillRunning) {
     // Process already finished (Wait() or Kill() path) but no async waiter was ever
     // requested. Materialize a ready future now.
     std::promise<int> ready_promise;
     ready_promise.set_value(cached);
     auto fut = ready_promise.get_future().share();
-    std::lock_guard<std::mutex> lk(wait_async_mu_);
-    if (!exit_code_future_.valid()) {
-      exit_code_future_ = fut;
+    std::lock_guard<std::mutex> lk(state_->wait_async_mu);
+    if (!state_->exit_code_future.valid()) {
+      state_->exit_code_future = fut;
     }
-    return exit_code_future_;
+    return state_->exit_code_future;
   }
 
   // Need to initialize async wait state exactly once.
   std::shared_ptr<std::promise<int>> new_promise;
   bool spawn_waiter = false;
   {
-    std::lock_guard<std::mutex> lk(wait_async_mu_);
-    if (!exit_code_future_.valid()) {
+    std::lock_guard<std::mutex> lk(state_->wait_async_mu);
+    if (!state_->exit_code_future.valid()) {
       new_promise = std::make_shared<std::promise<int>>();
-      exit_code_future_ = new_promise->get_future().share();
-      exit_code_promise_ = new_promise;  // consumed by Wait() completion path.
+      state_->exit_code_future = new_promise->get_future().share();
+      state_->exit_code_promise = new_promise;  // consumed by Wait() completion path.
       spawn_waiter = true;
     }
   }
 
   if (spawn_waiter) {
     // Launch detached waiter thread to perform blocking wait and fulfill promise.
-    // Assumption: caller retains Process object lifetime until future becomes ready.
-    std::thread([this]() {
-      int code = this->DoWait();  // Direct OS wait, bypasses future check.
-      // If DoWait() executed before promise installed (race), attempt to publish now.
-      if (exit_code_promise_) {
+    Process copy = *this;  // Shares ProcessState so async wait survives caller scope exit.
+    std::thread([copy = std::move(copy)]() mutable {
+      int code = copy.DoWait();  // Direct OS wait, bypasses future check.
+      auto promise = copy.state_->exit_code_promise;
+      if (promise) {
         try {
           // set_value may throw on double set; ignore.
-          exit_code_promise_->set_value(code);
+          promise->set_value(code);
         } catch (...) {
         }
       }
     }).detach();
   }
 
-  return exit_code_future_;
+  return state_->exit_code_future;
 }
 
 std::pair<Process, std::error_code> Process::Spawn(const std::vector<std::string> &args,
@@ -634,11 +649,12 @@ int Process::DoWait() const {
   // Attempt to publish result (single-writer expected). If another thread beat us,
   // prefer the published value.
   int expected = kStillRunning;
-  if (!exit_code_.compare_exchange_strong(expected, result, std::memory_order_acq_rel)) {
+  if (!state_->exit_code.compare_exchange_strong(expected, result,
+                                                 std::memory_order_acq_rel)) {
     result = expected;  // someone else set it; use that value
-  } else if (exit_code_promise_) {
+  } else if (state_->exit_code_promise) {
     try {
-      exit_code_promise_->set_value(result);
+      state_->exit_code_promise->set_value(result);
     } catch (...) {
       // Ignore double-set or broken promise.
     }
@@ -647,7 +663,7 @@ int Process::DoWait() const {
 }
 
 int Process::Wait() const {
-  int cached = exit_code_.load(std::memory_order_acquire);
+  int cached = state_->exit_code.load(std::memory_order_acquire);
   if (cached != kStillRunning) {
     return cached;  // already waited
   }
@@ -657,9 +673,9 @@ int Process::Wait() const {
   // which would fail on Windows (handle can only be waited on once).
   std::shared_future<int> async_future;
   {
-    std::lock_guard<std::mutex> lk(wait_async_mu_);
-    if (exit_code_future_.valid()) {
-      async_future = exit_code_future_;
+    std::lock_guard<std::mutex> lk(state_->wait_async_mu);
+    if (state_->exit_code_future.valid()) {
+      async_future = state_->exit_code_future;
     }
   }
   if (async_future.valid()) {

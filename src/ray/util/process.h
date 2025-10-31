@@ -26,12 +26,12 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <system_error>
 #include <utility>
 #include <vector>
-#include <mutex>
 
 #include "ray/util/compat.h"
 #include "ray/util/logging.h"
@@ -70,13 +70,12 @@ typedef std::map<std::string, std::string, EnvironmentVariableLess> ProcessEnvir
 using StartupToken = int64_t;
 
 class ProcessFD;
+struct ProcessState;
 
 class Process {
  protected:
   std::shared_ptr<ProcessFD> p_;
-  // Mutable so const Wait()/ExitCode() can update once the process terminates.
-  mutable std::atomic<int> exit_code_{kStillRunning};
-  std::shared_ptr<std::promise<int>> exit_code_promise_;
+  std::shared_ptr<ProcessState> state_;
 
   explicit Process(pid_t pid);
 
@@ -141,7 +140,8 @@ class Process {
   /// If already terminated (cached, dummy, or null) returns an immediately ready
   /// shared_future without spawning a thread.
   /// Semantics:
-  ///   - Normal spawned processes: native exit / (128+signal) on POSIX, GetExitCodeProcess on Windows.
+  ///   - Normal spawned processes: native exit / (128+signal) on POSIX,
+  ///   GetExitCodeProcess on Windows.
   ///   - Dummy (pid < 0): exit 0 immediately.
   ///   - Null (default constructed): exit -1 immediately.
   ///   - FromPid() with no handle: resolves -1 (unknown) silently.
@@ -175,11 +175,6 @@ class Process {
   /// Used by both Wait() and the WaitAsync() detached thread.
   /// Should not be called directly if WaitAsync() has already been invoked.
   int DoWait() const;
-
-  // Guard to ensure we only initialize the async wait state once.
-  mutable std::mutex wait_async_mu_;
-  // Cached shared future representing the exit code once available (ready or pending).
-  mutable std::shared_future<int> exit_code_future_;
 };
 
 // Get the Process ID of the parent process. If the parent process exits, the PID

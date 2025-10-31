@@ -19,6 +19,7 @@
 
 #include <boost/process/child.hpp>
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>
 #include <fstream>
 #include <string>
@@ -29,6 +30,61 @@
 #include "ray/util/logging.h"
 
 namespace ray {
+
+namespace {
+
+std::vector<std::string> MakeExitCommandArgs(int exit_code, bool delayed) {
+  std::vector<std::string> args;
+#ifdef _WIN32
+  std::string command;
+  if (delayed) {
+    command = "timeout /T 1 /NOBREAK >NUL & exit " + std::to_string(exit_code);
+  } else {
+    command = "exit " + std::to_string(exit_code);
+  }
+  args = {"cmd.exe", "/C", command};
+#else
+  std::string command;
+  if (delayed) {
+    command = "sleep 1; exit " + std::to_string(exit_code);
+  } else {
+    command = "exit " + std::to_string(exit_code);
+  }
+  args = {"bash", "-c", command};
+#endif
+  return args;
+}
+
+std::string ResolveSleepLoopExecutable() {
+#ifdef _WIN32
+  const char *binary_name = "sleep_loop.exe";
+#else
+  const char *binary_name = "sleep_loop";
+#endif
+  std::vector<std::string> candidates;
+  if (const char *test_srcdir = std::getenv("TEST_SRCDIR")) {
+    candidates.emplace_back(std::string(test_srcdir) + "/io_ray/src/ray/util/tests/" +
+                            binary_name);
+  }
+  candidates.emplace_back("./bazel-bin/src/ray/util/tests/" + std::string(binary_name));
+  candidates.emplace_back(binary_name);
+  for (const auto &path : candidates) {
+    std::ifstream f(path, std::ios::binary);
+    if (f.good()) {
+      return path;
+    }
+  }
+  return candidates.back();
+}
+
+std::vector<std::string> MakeSleepLoopArgs(int millis) {
+  std::vector<std::string> args;
+  args.emplace_back(ResolveSleepLoopExecutable());
+  args.emplace_back("--millis=" + std::to_string(millis));
+  return args;
+}
+
+}  // namespace
 
 TEST(UtilTest, IsProcessAlive) {
   namespace bp = boost::process;
@@ -328,6 +384,76 @@ TEST(UtilTest, WaitAsyncImmediateNull) {
   ASSERT_EQ(fut.wait_for(std::chrono::seconds(0)), std::future_status::ready);
   ASSERT_EQ(fut.get(), -1);
   ASSERT_EQ(null_proc.ExitCode(), -1);
+}
+
+TEST(UtilTest, WaitAsyncProcessAlreadyExitedWithoutPriorWait) {
+  // Spawn a helper that exits immediately, then wait long enough to ensure it has
+  // terminated before registering the async wait. This exercises the path where
+  // WaitAsync() must observe a process that is already gone without any prior Wait().
+  auto args = MakeSleepLoopArgs(0);
+  auto pair = Process::Spawn(args, /*decouple*/ false);
+  ASSERT_FALSE(pair.second) << pair.second.message();
+  Process &proc = pair.first;
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  auto fut = proc.WaitAsync();
+  ASSERT_TRUE(fut.valid());
+  ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  int code = fut.get();
+  ASSERT_EQ(code, 0);
+  ASSERT_EQ(proc.ExitCode(), 0);
+  ASSERT_EQ(proc.Wait(), 0);
+}
+
+TEST(UtilTest, WaitAsyncFutureSurvivesProcessScope) {
+  const int expected = 0;
+  std::shared_future<int> fut;
+  {
+    auto args = MakeSleepLoopArgs(500);
+    auto pair = Process::Spawn(args, /*decouple*/ false);
+    ASSERT_FALSE(pair.second) << pair.second.message();
+    fut = pair.first.WaitAsync();
+  }
+  ASSERT_TRUE(fut.valid());
+  ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  ASSERT_EQ(fut.get(), expected);
+}
+
+TEST(UtilTest, WaitAsyncSupportsRvalueProcess) {
+  const int expected = 0;
+  auto spawn_future = [expected]() {
+    auto args = MakeSleepLoopArgs(500);
+    auto pair = Process::Spawn(args, /*decouple*/ false);
+    EXPECT_FALSE(pair.second) << pair.second.message();
+    Process proc = std::move(pair.first);
+    return std::move(proc).WaitAsync();
+  };
+
+  auto fut = spawn_future();
+  ASSERT_TRUE(fut.valid());
+  ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  ASSERT_EQ(fut.get(), expected);
+}
+
+TEST(UtilTest, WaitAsyncSupportsDecoupledSpawn) {
+  // Verify decoupled processes still resolve via WaitAsync() and Wait(). On POSIX the
+  // exit code is not propagated (pipe close = 0), while on Windows we observe the real
+  // exit status; both should agree on zero given the helper executable.
+  auto args = MakeSleepLoopArgs(200);
+  auto pair = Process::Spawn(args, /*decouple*/ true);
+  ASSERT_FALSE(pair.second) << pair.second.message();
+  Process &proc = pair.first;
+
+  auto fut = proc.WaitAsync();
+  ASSERT_TRUE(fut.valid());
+  ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+  int async_code = fut.get();
+  ASSERT_EQ(async_code, 0);
+
+  int wait_code = proc.Wait();
+  ASSERT_EQ(wait_code, async_code);
+  ASSERT_EQ(proc.ExitCode(), async_code);
 }
 
 TEST(UtilTest, WaitAsyncThenKillNoDoubleWait) {
