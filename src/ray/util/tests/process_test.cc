@@ -19,14 +19,34 @@
 
 #include <boost/process/child.hpp>
 #include <chrono>
-#include <cstdio>
 #include <thread>
 #include <vector>
 
+#include "process_behavior_test_utils.h"
+#include "ray/util/fake_process.h"
 #include "ray/util/logging.h"
 #include "ray/util/process_utils.h"
+#include "ray/util/temporary_directory.h"
+
+#if !defined(_WIN32)
+#include <signal.h>
+#endif
 
 namespace ray {
+
+namespace {
+
+std::unique_ptr<ProcessInterface> SpawnProcessBehaviorHelper(
+    const std::vector<std::string> &args) {
+  std::vector<std::string> command = {test::ProcessBehaviorHelperPath()};
+  command.insert(command.end(), args.begin(), args.end());
+  auto [process, error] = Process::Spawn(command, /*decouple=*/false);
+  RAY_CHECK(!error) << error.message();
+  RAY_CHECK(process->IsValid());
+  return std::move(process);
+}
+
+}  // namespace
 
 TEST(UtilTest, IsProcessAlive) {
   namespace bp = boost::process;
@@ -101,6 +121,144 @@ TEST(UtilTest, CompareProcessObjects) {
   ASSERT_TRUE(!std::equal_to<Process>()(valid1, other_valid));
 
   ASSERT_TRUE(std::equal_to<Process>()(valid1, valid1));
+}
+
+TEST(UtilTest, FakeProcessTracksActionOrdering) {
+  FakeProcess process(/*pid=*/1234);
+  process.SetExitCode(17);
+
+  EXPECT_EQ(process.KillCallCount(), 0);
+  EXPECT_EQ(process.WaitCallCount(), 0);
+  EXPECT_EQ(process.IsAliveCallCount(), 0);
+  EXPECT_EQ(process.GracefulTerminationRequestCount(), 0);
+  EXPECT_EQ(process.GracefulTerminationUnsupportedCount(), 0);
+
+  EXPECT_TRUE(process.IsAlive());
+  EXPECT_EQ(process.IsAliveCallCount(), 1);
+  process.RecordGracefulTerminationRequest("posix-sigterm");
+  EXPECT_EQ(process.GracefulTerminationRequestCount(), 1);
+  EXPECT_EQ(process.LastGracefulTerminationMechanism(), "posix-sigterm");
+  EXPECT_EQ(process.Wait(), 17);
+  EXPECT_EQ(process.WaitCallCount(), 1);
+  process.RecordGracefulTerminationUnsupported("windows-console-event");
+  EXPECT_EQ(process.GracefulTerminationUnsupportedCount(), 1);
+  EXPECT_EQ(process.LastGracefulTerminationMechanism(), "windows-console-event");
+
+  process.Kill();
+  EXPECT_TRUE(process.WasKilled());
+  EXPECT_FALSE(process.IsAlive());
+  EXPECT_EQ(process.KillCallCount(), 1);
+  EXPECT_EQ(process.IsAliveCallCount(), 2);
+  EXPECT_THAT(process.RecordedActions(),
+              ::testing::ElementsAre("is_alive",
+                                     "graceful",
+                                     "wait",
+                                     "graceful_unsupported",
+                                     "kill",
+                                     "is_alive"));
+
+  process.ResetKilled();
+  process.ResetCallCounts();
+  EXPECT_FALSE(process.WasKilled());
+  EXPECT_EQ(process.KillCallCount(), 0);
+  EXPECT_EQ(process.WaitCallCount(), 0);
+  EXPECT_EQ(process.IsAliveCallCount(), 0);
+  EXPECT_EQ(process.GracefulTerminationRequestCount(), 0);
+  EXPECT_EQ(process.GracefulTerminationUnsupportedCount(), 0);
+  EXPECT_TRUE(process.LastGracefulTerminationMechanism().empty());
+  EXPECT_TRUE(process.RecordedActions().empty());
+}
+
+TEST(UtilTest, ProcessBehaviorHelperExitsWithRequestedCode) {
+  auto process = SpawnProcessBehaviorHelper({"--exit-code=23"});
+  const int status = process->Wait();
+#if defined(_WIN32)
+  EXPECT_EQ(status, 23);
+#else
+  // POSIX Process::Wait currently uses Ray's liveness pipe for spawned processes,
+  // so it observes process death but does not preserve the raw exit code yet.
+  EXPECT_EQ(status, 0);
+#endif
+}
+
+TEST(UtilTest, ProcessBehaviorHelperWritesReadyFile) {
+  ScopedTemporaryDirectory temp_dir;
+  const auto ready_file = temp_dir.GetDirectory() / "ready.txt";
+  auto process = SpawnProcessBehaviorHelper(
+      {"--ready-file=" + ready_file.string(), "--sleep-ms=5000"});
+  ASSERT_TRUE(test::WaitForFile(ready_file, std::chrono::seconds(5)));
+  EXPECT_EQ(test::ReadFile(ready_file), "ready\n");
+  process->Kill();
+  process->Wait();
+}
+
+TEST(UtilTest, ProcessBehaviorHelperWaitsForChildProcess) {
+  ScopedTemporaryDirectory temp_dir;
+  const auto child_marker_file = temp_dir.GetDirectory() / "child.txt";
+  auto process = SpawnProcessBehaviorHelper({"--spawn-child=wait",
+                                             "--child-marker-file=" +
+                                                 child_marker_file.string()});
+  const int status = process->Wait();
+#if defined(_WIN32)
+  EXPECT_EQ(status, 0);
+#else
+  EXPECT_EQ(status, 0);
+#endif
+  EXPECT_EQ(test::ReadFile(child_marker_file), "child-started\nchild-exiting\n");
+}
+
+TEST(UtilTest, ProcessBehaviorHelperCanLeaveBoundedChildRunning) {
+  ScopedTemporaryDirectory temp_dir;
+  const auto child_marker_file = temp_dir.GetDirectory() / "child.txt";
+  auto process = SpawnProcessBehaviorHelper({"--spawn-child=leak",
+                                             "--child-marker-file=" +
+                                                 child_marker_file.string()});
+  process->Wait();
+  ASSERT_TRUE(test::WaitForFile(child_marker_file, std::chrono::seconds(5)));
+  EXPECT_THAT(test::ReadFile(child_marker_file), ::testing::HasSubstr("child-started\n"));
+}
+
+TEST(UtilTest, ProcessBehaviorHelperHandlesPosixGracefulTermination) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "Windows graceful console-event delivery is covered by a later 1B "
+                  "Bazel compatibility probe.";
+#else
+  ScopedTemporaryDirectory temp_dir;
+  const auto ready_file = temp_dir.GetDirectory() / "ready.txt";
+  const auto marker_file = temp_dir.GetDirectory() / "graceful.txt";
+  auto process = SpawnProcessBehaviorHelper({"--ready-file=" + ready_file.string(),
+                                             "--marker-file=" + marker_file.string(),
+                                             "--handle-graceful",
+                                             "--graceful-exit-code=42",
+                                             "--sleep-ms=5000"});
+
+  ASSERT_TRUE(test::WaitForFile(ready_file, std::chrono::seconds(5)));
+  ASSERT_EQ(kill(process->GetId(), SIGTERM), 0);
+  ASSERT_TRUE(test::WaitForFile(marker_file, std::chrono::seconds(5)));
+  EXPECT_EQ(test::ReadFile(marker_file), "graceful\n");
+  EXPECT_EQ(process->Wait(), 0);
+#endif
+}
+
+TEST(UtilTest, ProcessBehaviorHelperCanIgnorePosixGracefulTermination) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "Windows graceful console-event delivery is covered by a later 1B "
+                  "Bazel compatibility probe.";
+#else
+  ScopedTemporaryDirectory temp_dir;
+  const auto ready_file = temp_dir.GetDirectory() / "ready.txt";
+  auto process = SpawnProcessBehaviorHelper({"--ready-file=" + ready_file.string(),
+                                             "--ignore-graceful",
+                                             "--sleep-ms=5000"});
+
+  ASSERT_TRUE(test::WaitForFile(ready_file, std::chrono::seconds(5)));
+  ASSERT_EQ(kill(process->GetId(), SIGTERM), 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  EXPECT_TRUE(process->IsAlive());
+
+  process->Kill();
+  process->Wait();
+#endif
 }
 
 }  // namespace ray

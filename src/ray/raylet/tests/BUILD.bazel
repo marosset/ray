@@ -175,10 +175,12 @@ ray_cc_test(
         "//src/ray/raylet:fake_worker",
         "//src/ray/raylet:local_object_manager_interface",
         "//src/ray/raylet:raylet_lib",
+        "//src/ray/raylet:worker",
         "//src/ray/raylet/scheduling:cluster_lease_manager",
         "//src/ray/raylet_rpc_client:fake_raylet_client",
         "//src/ray/rpc:utils",
         "//src/ray/util:clock",
+        "//src/ray/util:fake_process",
         "//src/ray/util:macros",
     ],
 )

@@ -83,6 +83,7 @@ std::shared_ptr<ray::rpc::WorkerTableData> CreateWorkerFailureData(
   worker_failure_info_ptr->set_timestamp(timestamp);
   worker_failure_info_ptr->set_exit_type(disconnect_type);
   worker_failure_info_ptr->set_exit_detail(disconnect_detail);
+  worker_failure_info_ptr->set_pid(pid);
   worker_failure_info_ptr->set_end_time_ms(current_sys_time_ms());
   if (creation_task_exception != nullptr) {
     // this pointer will be freed by protobuf internal codes

@@ -47,9 +47,11 @@
 #include "ray/raylet/local_object_manager_interface.h"
 #include "ray/raylet/scheduling/cluster_lease_manager.h"
 #include "ray/raylet/tests/util.h"
+#include "ray/raylet/worker.h"
 #include "ray/raylet_rpc_client/fake_raylet_client.h"
 #include "ray/rpc/utils.h"
 #include "ray/util/clock.h"
+#include "ray/util/fake_process.h"
 
 namespace ray::raylet {
 using ::testing::_;
@@ -544,6 +546,67 @@ TEST_F(NodeManagerTest, HandleIsLocalWorkerDeadRegisteredWorker) {
       });
   EXPECT_TRUE(replied);
   EXPECT_FALSE(reply.is_dead());
+}
+
+TEST_F(NodeManagerTest, DisconnectClientReportsWorkerFailureMetadata) {
+  auto noop_message_handler = [](std::shared_ptr<ClientConnection>,
+                                 int64_t,
+                                 const std::vector<uint8_t> &) {};
+  auto connection_error_handler = [](std::shared_ptr<ClientConnection>,
+                                     const boost::system::error_code &) {};
+  local_stream_socket socket(io_service_);
+  auto client = ClientConnection::Create(std::move(noop_message_handler),
+                                         std::move(connection_error_handler),
+                                         std::move(socket),
+                                         "worker_failure_metadata_test",
+                                         {});
+
+  const WorkerID worker_id = WorkerID::FromRandom();
+  constexpr int kWorkerPid = 4242;
+  auto worker = std::make_shared<Worker>(JobID::FromInt(7),
+                                         /*runtime_env_hash=*/0,
+                                         worker_id,
+                                         rpc::Language::PYTHON,
+                                         rpc::WorkerType::WORKER,
+                                         "127.0.0.1",
+                                         client,
+                                         client_call_manager_);
+  worker->SetProcess(std::make_unique<FakeProcess>(kWorkerPid));
+  std::shared_ptr<WorkerInterface> worker_interface = worker;
+
+  std::shared_ptr<rpc::WorkerTableData> reported_failure;
+  EXPECT_CALL(mock_worker_pool_, GetRegisteredWorker(client))
+      .Times(2)
+      .WillRepeatedly(Return(worker_interface));
+  EXPECT_CALL(*mock_gcs_client_->mock_worker_accessor,
+              AsyncReportWorkerFailure(_, _))
+      .WillOnce([&reported_failure](
+                    const std::shared_ptr<rpc::WorkerTableData> &data_ptr,
+                    const rpc::StatusCallback &) { reported_failure = data_ptr; });
+  EXPECT_CALL(mock_worker_pool_,
+                  DisconnectWorker(worker_interface, rpc::WorkerExitType::INTENDED_USER_EXIT))
+      .Times(1);
+
+            flatbuffers::FlatBufferBuilder fbb;
+            auto disconnect_detail = fbb.CreateString("stage-1-disconnect-detail");
+            auto request = protocol::CreateDisconnectClientRequest(
+              fbb,
+              static_cast<int>(rpc::WorkerExitType::INTENDED_USER_EXIT),
+              disconnect_detail);
+            fbb.Finish(request);
+            node_manager_->ProcessClientMessage(
+              client,
+              static_cast<int64_t>(protocol::MessageType::DisconnectClientRequest),
+              fbb.GetBufferPointer());
+
+  ASSERT_NE(reported_failure, nullptr);
+  EXPECT_EQ(WorkerID::FromBinary(reported_failure->worker_address().worker_id()),
+            worker_id);
+  EXPECT_EQ(NodeID::FromBinary(reported_failure->worker_address().node_id()),
+            raylet_node_id_);
+  EXPECT_EQ(reported_failure->exit_type(), rpc::WorkerExitType::INTENDED_USER_EXIT);
+  EXPECT_EQ(reported_failure->exit_detail(), "stage-1-disconnect-detail");
+  EXPECT_EQ(reported_failure->pid(), kWorkerPid);
 }
 
 TEST_F(NodeManagerTest, TestRegisterGcsAndCheckSelfAlive) {

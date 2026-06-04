@@ -14,6 +14,9 @@
 
 #pragma once
 
+#include <string>
+#include <vector>
+
 #include "ray/util/process_interface.h"
 
 namespace ray {
@@ -38,7 +41,16 @@ class FakeProcess : public ProcessInterface {
    * @param pid The process ID to use.
    */
   explicit FakeProcess(pid_t pid)
-      : pid_(pid), is_alive_(true), exit_code_(0), is_null_(false), killed_(false) {}
+      : pid_(pid),
+        is_alive_(true),
+        exit_code_(0),
+        is_null_(false),
+        killed_(false),
+        kill_call_count_(0),
+        wait_call_count_(0),
+        is_alive_call_count_(0),
+        graceful_termination_request_count_(0),
+        graceful_termination_unsupported_count_(0) {}
 
   pid_t GetId() const override { return is_null_ ? -1 : pid_; }
 
@@ -47,13 +59,21 @@ class FakeProcess : public ProcessInterface {
   bool IsValid() const override { return !is_null_ && pid_ >= 0; }
 
   void Kill() override {
+    kill_call_count_++;
+    actions_.push_back("kill");
     killed_ = true;
     is_alive_ = false;
   }
 
-  bool IsAlive() const override { return is_alive_; }
+  bool IsAlive() const override {
+    is_alive_call_count_++;
+    actions_.push_back("is_alive");
+    return is_alive_;
+  }
 
   int Wait() const override {
+    wait_call_count_++;
+    actions_.push_back("wait");
     if (is_null_) {
       return -1;
     }
@@ -74,12 +94,61 @@ class FakeProcess : public ProcessInterface {
 
   void ResetKilled() { killed_ = false; }
 
+  void RecordGracefulTerminationRequest(std::string mechanism) {
+    graceful_termination_request_count_++;
+    last_graceful_termination_mechanism_ = std::move(mechanism);
+    actions_.push_back("graceful");
+  }
+
+  void RecordGracefulTerminationUnsupported(std::string mechanism) {
+    graceful_termination_unsupported_count_++;
+    last_graceful_termination_mechanism_ = std::move(mechanism);
+    actions_.push_back("graceful_unsupported");
+  }
+
+  int KillCallCount() const { return kill_call_count_; }
+
+  int WaitCallCount() const { return wait_call_count_; }
+
+  int IsAliveCallCount() const { return is_alive_call_count_; }
+
+  int GracefulTerminationRequestCount() const {
+    return graceful_termination_request_count_;
+  }
+
+  int GracefulTerminationUnsupportedCount() const {
+    return graceful_termination_unsupported_count_;
+  }
+
+  const std::string &LastGracefulTerminationMechanism() const {
+    return last_graceful_termination_mechanism_;
+  }
+
+  const std::vector<std::string> &RecordedActions() const { return actions_; }
+
+  void ResetCallCounts() {
+    kill_call_count_ = 0;
+    wait_call_count_ = 0;
+    is_alive_call_count_ = 0;
+    graceful_termination_request_count_ = 0;
+    graceful_termination_unsupported_count_ = 0;
+    last_graceful_termination_mechanism_.clear();
+    actions_.clear();
+  }
+
  private:
   pid_t pid_;
   bool is_alive_;
   int exit_code_;
   bool is_null_;
   bool killed_;
+  int kill_call_count_;
+  mutable int wait_call_count_;
+  mutable int is_alive_call_count_;
+  int graceful_termination_request_count_;
+  int graceful_termination_unsupported_count_;
+  std::string last_graceful_termination_mechanism_;
+  mutable std::vector<std::string> actions_;
 };
 
 }  // namespace ray

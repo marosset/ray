@@ -17,10 +17,13 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <functional>
 #include <iostream>
 #include <list>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -594,6 +597,113 @@ static inline LeaseSpecification ExampleLeaseSpec(
 
   message.mutable_runtime_env_info()->CopyFrom(runtime_env_info);
   return LeaseSpecification(std::move(message));
+}
+
+bool WaitForCondition(std::function<bool()> condition,
+                      std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (condition()) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return condition();
+}
+
+TEST_F(WorkerPoolTest, WorkerKillAsyncForceKillsProcessOnce) {
+  auto fake_process = std::make_unique<FakeProcess>(1234);
+  auto *fake_process_ptr = fake_process.get();
+  auto worker = worker_pool_->CreateWorker(WorkerID::FromRandom(), std::move(fake_process));
+
+  worker->KillAsync(io_service_, /*force=*/true);
+  worker->KillAsync(io_service_, /*force=*/true);
+
+  EXPECT_TRUE(worker->IsDead());
+  EXPECT_TRUE(fake_process_ptr->WasKilled());
+  EXPECT_EQ(fake_process_ptr->KillCallCount(), 1);
+  EXPECT_THAT(fake_process_ptr->RecordedActions(), ::testing::ElementsAre("kill"));
+}
+
+TEST_F(WorkerPoolTest, WorkerKillAsyncDoesNotKillAfterMarkDead) {
+  auto fake_process = std::make_unique<FakeProcess>(1234);
+  auto *fake_process_ptr = fake_process.get();
+  auto worker = worker_pool_->CreateWorker(WorkerID::FromRandom(), std::move(fake_process));
+
+  worker->MarkDead();
+  worker->KillAsync(io_service_, /*force=*/true);
+
+  EXPECT_TRUE(worker->IsDead());
+  EXPECT_FALSE(fake_process_ptr->WasKilled());
+  EXPECT_EQ(fake_process_ptr->KillCallCount(), 0);
+}
+
+TEST_F(WorkerPoolTest, WorkerKillAsyncWindowsNonForceTimeoutForceKillsOnce) {
+#if !defined(_WIN32)
+  GTEST_SKIP() << "POSIX non-force Worker::KillAsync sends SIGTERM to the real PID; "
+                  "fake-process coverage is limited to Windows until graceful requests "
+                  "flow through ProcessInterface.";
+#else
+  const auto old_timeout = RayConfig::instance().kill_worker_timeout_milliseconds();
+  RayConfig::instance().kill_worker_timeout_milliseconds() = 1;
+
+  auto fake_process = std::make_unique<FakeProcess>(1234);
+  auto *fake_process_ptr = fake_process.get();
+  auto worker = worker_pool_->CreateWorker(WorkerID::FromRandom(), std::move(fake_process));
+
+  worker->KillAsync(io_service_, /*force=*/false);
+  worker->KillAsync(io_service_, /*force=*/false);
+
+  EXPECT_TRUE(WaitForCondition(
+      [fake_process_ptr] { return fake_process_ptr->KillCallCount() == 1; },
+      std::chrono::seconds(1)));
+  EXPECT_TRUE(worker->IsDead());
+  EXPECT_EQ(fake_process_ptr->KillCallCount(), 1);
+
+  RayConfig::instance().kill_worker_timeout_milliseconds() = old_timeout;
+#endif
+}
+
+TEST_F(WorkerPoolTest, SuccessfulIdleExitMarksWorkerDeadWithoutOsKill) {
+  worker_pool_->num_available_cpus_ = 0;
+  auto fake_process = std::make_unique<FakeProcess>(1234);
+  auto *fake_process_ptr = fake_process.get();
+  auto worker = worker_pool_->CreateWorker(WorkerID::FromRandom(), std::move(fake_process));
+  worker_pool_->PushWorker(worker);
+
+  worker_pool_->SetCurrentTimeMs(600000);
+  worker_pool_->TryKillingIdleWorkers();
+
+  auto mock_rpc_client = mock_worker_rpc_clients_.at(worker->WorkerId());
+  ASSERT_EQ(mock_rpc_client->exit_count, 1);
+  EXPECT_FALSE(mock_rpc_client->last_exit_forced);
+  EXPECT_FALSE(worker->IsDead());
+  EXPECT_EQ(fake_process_ptr->KillCallCount(), 0);
+
+  ASSERT_TRUE(mock_rpc_client->ExitReplySucceed());
+  EXPECT_TRUE(worker->IsDead());
+  EXPECT_EQ(fake_process_ptr->KillCallCount(), 0);
+  EXPECT_EQ(worker_pool_->GetIdleWorkerSize(), 0);
+}
+
+TEST_F(WorkerPoolTest, FailedIdleExitRequeuesWorkerWithoutMarkingDead) {
+  worker_pool_->num_available_cpus_ = 0;
+  auto fake_process = std::make_unique<FakeProcess>(1234);
+  auto *fake_process_ptr = fake_process.get();
+  auto worker = worker_pool_->CreateWorker(WorkerID::FromRandom(), std::move(fake_process));
+  worker_pool_->PushWorker(worker);
+
+  worker_pool_->SetCurrentTimeMs(600000);
+  worker_pool_->TryKillingIdleWorkers();
+
+  auto mock_rpc_client = mock_worker_rpc_clients_.at(worker->WorkerId());
+  ASSERT_EQ(mock_rpc_client->exit_count, 1);
+  EXPECT_EQ(fake_process_ptr->KillCallCount(), 0);
+
+  ASSERT_TRUE(mock_rpc_client->ExitReplyFailed());
+  EXPECT_FALSE(worker->IsDead());
+  EXPECT_EQ(fake_process_ptr->KillCallCount(), 0);
+  EXPECT_EQ(worker_pool_->GetIdleWorkerSize(), 1);
 }
 
 TEST_F(WorkerPoolDriverRegisteredTest, TestGetRegisteredDriver) {

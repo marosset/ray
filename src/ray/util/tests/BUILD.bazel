@@ -1,4 +1,4 @@
-load("//bazel:ray.bzl", "ray_cc_test")
+load("//bazel:ray.bzl", "ray_cc_binary", "ray_cc_test")
 
 ray_cc_test(
     name = "clock_test",
@@ -155,15 +155,48 @@ ray_cc_test(
     ],
 )
 
+ray_cc_binary(
+    name = "process_behavior_helper",
+    srcs = ["process_behavior_helper.cc"],
+    testonly = True,
+    visibility = ["//visibility:private"],
+)
+
 ray_cc_test(
     name = "process_test",
     size = "small",
-    srcs = ["process_test.cc"],
+    srcs = [
+        "process_behavior_test_utils.h",
+        "process_test.cc",
+    ],
+    data = [":process_behavior_helper"],
+    env = {
+        "TEST_PROCESS_BEHAVIOR_HELPER_EXEC_PATH": "$(rootpath :process_behavior_helper)",
+    },
     tags = ["team:core"],
     deps = [
+        "//src/ray/util:fake_process",
         "//src/ray/util:process",
         "//src/ray/util:process_utils",
+        "//src/ray/util:temporary_directory",
         "@boost//:process",
+    ],
+)
+
+ray_cc_test(
+    name = "windows_process_environment_probe_test",
+    size = "small",
+    srcs = [
+        "process_behavior_test_utils.h",
+        "windows_process_environment_probe.cc",
+    ],
+    data = [":process_behavior_helper"],
+    env = {
+        "TEST_PROCESS_BEHAVIOR_HELPER_EXEC_PATH": "$(rootpath :process_behavior_helper)",
+    },
+    tags = ["team:core"],
+    deps = [
+        "//src/ray/util:temporary_directory",
     ],
 )
 
