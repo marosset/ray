@@ -93,8 +93,8 @@ ChildMode ParseChildMode(const std::string &value) {
   std::exit(2);
 }
 
-std::string QuoteArg(const std::string &arg) {
 #ifdef _WIN32
+std::string QuoteArg(const std::string &arg) {
   std::string quoted = "\"";
   for (const char character : arg) {
     if (character == '"') {
@@ -105,10 +105,8 @@ std::string QuoteArg(const std::string &arg) {
   }
   quoted += "\"";
   return quoted;
-#else
-  return arg;
-#endif
 }
+#endif
 
 std::vector<std::string> ChildArgs(const std::string &executable_path,
                                   const Options &options) {
