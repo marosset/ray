@@ -15,9 +15,9 @@
 namespace ray {
 namespace {
 
-std::string BoolString(bool value) { return value ? "true" : "false"; }
-
 #ifdef _WIN32
+
+std::string BoolString(bool value) { return value ? "true" : "false"; }
 
 std::string QuoteArg(const std::string &arg) {
   std::string quoted = "\"";
