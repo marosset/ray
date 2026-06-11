@@ -650,6 +650,19 @@ class WorkerPool : public WorkerPoolInterface {
     std::optional<absl::Duration> worker_startup_keep_alive_duration;
   };
 
+    /// Classifies whether worker registration used the process started by the raylet.
+    enum class WorkerProcessRegistrationStatus {
+        kRayletStartedPidMatchesRegisteredPid = 0,
+        kRayletStartedPidDiffersFromRegisteredPid = 1,
+        kRayletStartedProcessMissing = 2,
+    };
+
+    static WorkerProcessRegistrationStatus ClassifyWorkerProcessRegistration(
+            const WorkerProcessInfo &starting_process_info, pid_t registered_pid);
+
+    static std::string_view WorkerProcessRegistrationStatusName(
+            WorkerProcessRegistrationStatus status);
+
   /// An internal data structure that maintains the pool state per language.
   struct State {
     /// The commands and arguments used to start the worker process

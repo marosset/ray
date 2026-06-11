@@ -178,6 +178,7 @@ class WorkerPoolMock : public WorkerPool {
   }
 
   using WorkerPool::StartWorkerProcess;  // we need this to be public for testing
+  using WorkerProcessRegistrationStatus = WorkerPool::WorkerProcessRegistrationStatus;
 
   using WorkerPool::PopWorkerCallbackInternal;
 
@@ -256,6 +257,20 @@ class WorkerPoolMock : public WorkerPool {
   }
 
   WorkerID GetWorkerId(pid_t pid) { return worker_ids_by_proc_[pid]; }
+
+  WorkerProcessRegistrationStatus ClassifyWorkerProcessRegistrationForTest(
+      const Language language, const WorkerID &worker_id, pid_t registered_pid) const {
+    const auto state_it = states_by_lang_.find(language);
+    RAY_CHECK(state_it != states_by_lang_.end());
+    const auto process_it = state_it->second.worker_processes.find(worker_id);
+    RAY_CHECK(process_it != state_it->second.worker_processes.end());
+    return ClassifyWorkerProcessRegistration(process_it->second, registered_pid);
+  }
+
+  static std::string_view WorkerProcessRegistrationStatusNameForTest(
+      WorkerProcessRegistrationStatus status) {
+    return WorkerProcessRegistrationStatusName(status);
+  }
 
   int GetProcessSize() const { return worker_commands_by_proc_.size(); }
 
@@ -756,6 +771,49 @@ TEST_F(WorkerPoolDriverRegisteredTest, HandleWorkerRegistration) {
         worker, /*disconnect_type=*/rpc::WorkerExitType::INTENDED_USER_EXIT);
     ASSERT_EQ(worker_pool_->NumWorkersStarting(), 0);
   }
+}
+
+TEST_F(WorkerPoolDriverRegisteredTest,
+       ClassifiesWorkerRegistrationWithMatchingStartedPid) {
+  auto status = PopWorkerStatus::OK;
+  auto [proc, worker_id] = worker_pool_->StartWorkerProcess(
+      Language::PYTHON, rpc::WorkerType::WORKER, JOB_ID, &status);
+  ASSERT_EQ(status, PopWorkerStatus::OK);
+
+  EXPECT_EQ(worker_pool_->ClassifyWorkerProcessRegistrationForTest(
+                Language::PYTHON, worker_id, proc.GetId()),
+            WorkerPoolMock::WorkerProcessRegistrationStatus::
+                kRayletStartedPidMatchesRegisteredPid);
+  EXPECT_EQ(WorkerPoolMock::WorkerProcessRegistrationStatusNameForTest(
+                WorkerPoolMock::WorkerProcessRegistrationStatus::
+                    kRayletStartedPidMatchesRegisteredPid),
+            "raylet_started_pid_matches_registered_pid");
+
+  auto worker = worker_pool_->CreateWorker(worker_id, nullptr, Language::PYTHON);
+  RAY_CHECK_OK(worker_pool_->RegisterWorker(worker, proc.GetId(), [](Status, int) {}));
+  EXPECT_EQ(worker->GetProcess().GetId(), proc.GetId());
+}
+
+TEST_F(WorkerPoolDriverRegisteredTest,
+       ClassifiesWorkerRegistrationWithDifferentRegisteredPid) {
+  auto status = PopWorkerStatus::OK;
+  auto [proc, worker_id] = worker_pool_->StartWorkerProcess(
+      Language::PYTHON, rpc::WorkerType::WORKER, JOB_ID, &status);
+  ASSERT_EQ(status, PopWorkerStatus::OK);
+  const pid_t registered_pid = proc.GetId() + 1;
+
+  EXPECT_EQ(worker_pool_->ClassifyWorkerProcessRegistrationForTest(
+                Language::PYTHON, worker_id, registered_pid),
+            WorkerPoolMock::WorkerProcessRegistrationStatus::
+                kRayletStartedPidDiffersFromRegisteredPid);
+  EXPECT_EQ(WorkerPoolMock::WorkerProcessRegistrationStatusNameForTest(
+                WorkerPoolMock::WorkerProcessRegistrationStatus::
+                    kRayletStartedPidDiffersFromRegisteredPid),
+            "raylet_started_pid_differs_from_registered_pid");
+
+  auto worker = worker_pool_->CreateWorker(worker_id, nullptr, Language::PYTHON);
+  RAY_CHECK_OK(worker_pool_->RegisterWorker(worker, registered_pid, [](Status, int) {}));
+  EXPECT_EQ(worker->GetProcess().GetId(), registered_pid);
 }
 
 TEST_F(WorkerPoolDriverRegisteredTest, HandleUnknownWorkerRegistration) {

@@ -802,6 +802,32 @@ boost::optional<const rpc::JobConfig &> WorkerPool::GetJobConfig(
                                  : boost::optional<const rpc::JobConfig &>(iter->second);
 }
 
+WorkerPool::WorkerProcessRegistrationStatus
+WorkerPool::ClassifyWorkerProcessRegistration(
+    const WorkerProcessInfo &starting_process_info, pid_t registered_pid) {
+  const auto &started_process = starting_process_info.proc;
+  if (started_process == nullptr || started_process->IsNull()) {
+    return WorkerProcessRegistrationStatus::kRayletStartedProcessMissing;
+  }
+  if (started_process->GetId() == registered_pid) {
+    return WorkerProcessRegistrationStatus::kRayletStartedPidMatchesRegisteredPid;
+  }
+  return WorkerProcessRegistrationStatus::kRayletStartedPidDiffersFromRegisteredPid;
+}
+
+std::string_view WorkerPool::WorkerProcessRegistrationStatusName(
+    WorkerProcessRegistrationStatus status) {
+  switch (status) {
+  case WorkerProcessRegistrationStatus::kRayletStartedPidMatchesRegisteredPid:
+    return "raylet_started_pid_matches_registered_pid";
+  case WorkerProcessRegistrationStatus::kRayletStartedPidDiffersFromRegisteredPid:
+    return "raylet_started_pid_differs_from_registered_pid";
+  case WorkerProcessRegistrationStatus::kRayletStartedProcessMissing:
+    return "raylet_started_process_missing";
+  }
+  return "unknown_worker_process_registration_status";
+}
+
 Status WorkerPool::RegisterWorker(const std::shared_ptr<WorkerInterface> &worker,
                                   pid_t pid,
                                   std::function<void(Status, int)> send_reply_callback) {
@@ -815,6 +841,26 @@ Status WorkerPool::RegisterWorker(const std::shared_ptr<WorkerInterface> &worker
     Status status = Status::Invalid("Unknown worker");
     send_reply_callback(status, /*port=*/0);
     return status;
+  }
+
+  auto &starting_process_info = it->second;
+  const auto registration_status =
+      ClassifyWorkerProcessRegistration(starting_process_info, pid);
+  if (registration_status == WorkerProcessRegistrationStatus::
+                                 kRayletStartedPidDiffersFromRegisteredPid) {
+    RAY_LOG(WARNING).WithField(worker_id)
+        << "Worker registered with pid " << pid << " but raylet started pid "
+        << starting_process_info.proc->GetId()
+        << "; treating the registered pid as the worker process for now. "
+        << "process_registration_status: "
+        << WorkerProcessRegistrationStatusName(registration_status);
+  } else if (registration_status ==
+             WorkerProcessRegistrationStatus::kRayletStartedProcessMissing) {
+    RAY_LOG(WARNING).WithField(worker_id)
+        << "Worker registered with pid " << pid
+        << " but raylet no longer has a started process record. "
+        << "process_registration_status: "
+        << WorkerProcessRegistrationStatusName(registration_status);
   }
 
   std::unique_ptr<ProcessInterface> process = std::make_unique<Process>(pid);
@@ -842,7 +888,6 @@ Status WorkerPool::RegisterWorker(const std::shared_ptr<WorkerInterface> &worker
     send_reply_callback(status, /*port=*/0);
     return status;
   }
-  auto &starting_process_info = it->second;
   auto end = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
       end - starting_process_info.start_time);
@@ -850,7 +895,9 @@ Status WorkerPool::RegisterWorker(const std::shared_ptr<WorkerInterface> &worker
   RAY_LOG(DEBUG).WithField(worker_id)
       << "Registering worker with pid " << pid << ", port: " << port
       << ", register cost: " << duration.count()
-      << ", worker_type: " << rpc::WorkerType_Name(worker->GetWorkerType());
+      << ", worker_type: " << rpc::WorkerType_Name(worker->GetWorkerType())
+      << ", process_registration_status: "
+      << WorkerProcessRegistrationStatusName(registration_status);
   worker->SetAssignedPort(port);
 
   state.registered_workers.insert(worker);
