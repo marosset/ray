@@ -136,6 +136,20 @@ class Process : public ProcessInterface {
 
   bool IsAlive() const override;
 
+  /**
+   * @brief Waits for this process to terminate and returns structured exit details.
+   * @details Windows reports the process exit code. POSIX waitpid-backed process
+   *          wrappers decode normal exits and signal termination. POSIX liveness-pipe
+   *          paths can report process death even when the exact exit status is unknown.
+   */
+  ProcessExitStatus WaitForExit() const override;
+
+  /**
+   * @brief Waits for this process to terminate and returns the legacy integer status.
+   * @details Kept for compatibility with existing callers. New code that needs to
+   *          distinguish normal exits, signals, and unknown statuses should use
+   *          WaitForExit().
+   */
   int Wait() const override;
 
  private:

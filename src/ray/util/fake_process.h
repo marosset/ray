@@ -48,6 +48,7 @@ class FakeProcess : public ProcessInterface {
         killed_(false),
         kill_call_count_(0),
         wait_call_count_(0),
+        wait_for_exit_call_count_(0),
         is_alive_call_count_(0),
         graceful_termination_request_count_(0),
         graceful_termination_unsupported_count_(0) {}
@@ -69,6 +70,15 @@ class FakeProcess : public ProcessInterface {
     is_alive_call_count_++;
     actions_.push_back("is_alive");
     return is_alive_;
+  }
+
+  ProcessExitStatus WaitForExit() const override {
+    wait_for_exit_call_count_++;
+    actions_.push_back("wait_for_exit");
+    if (is_null_) {
+      return ProcessExitStatus::Unknown(/*pid=*/-1);
+    }
+    return ProcessExitStatus::Exited(pid_, exit_code_, exit_code_);
   }
 
   int Wait() const override {
@@ -110,6 +120,8 @@ class FakeProcess : public ProcessInterface {
 
   int WaitCallCount() const { return wait_call_count_; }
 
+  int WaitForExitCallCount() const { return wait_for_exit_call_count_; }
+
   int IsAliveCallCount() const { return is_alive_call_count_; }
 
   int GracefulTerminationRequestCount() const {
@@ -129,6 +141,7 @@ class FakeProcess : public ProcessInterface {
   void ResetCallCounts() {
     kill_call_count_ = 0;
     wait_call_count_ = 0;
+    wait_for_exit_call_count_ = 0;
     is_alive_call_count_ = 0;
     graceful_termination_request_count_ = 0;
     graceful_termination_unsupported_count_ = 0;
@@ -144,6 +157,7 @@ class FakeProcess : public ProcessInterface {
   bool killed_;
   int kill_call_count_;
   mutable int wait_call_count_;
+  mutable int wait_for_exit_call_count_;
   mutable int is_alive_call_count_;
   int graceful_termination_request_count_;
   int graceful_termination_unsupported_count_;

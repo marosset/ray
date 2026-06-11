@@ -449,8 +449,8 @@ bool Process::IsNull() const { return pid_ == -1; }
 
 bool Process::IsValid() const { return GetId() != -1; }
 
-int Process::Wait() const {
-  int status = -1;
+ProcessExitStatus Process::WaitForExit() const {
+  ProcessExitStatus status = ProcessExitStatus::Unknown(pid_);
   if (IsValid()) {
     if (pid_ >= 0) {
       std::error_code error;
@@ -459,10 +459,11 @@ int Process::Wait() const {
       DWORD exit_code = STILL_ACTIVE;
       if (WaitForSingleObject(handle, INFINITE) == WAIT_OBJECT_0 &&
           GetExitCodeProcess(handle, &exit_code)) {
-        status = static_cast<int>(exit_code);
+        status = ProcessExitStatus::Exited(
+            pid_, static_cast<int64_t>(exit_code), static_cast<int>(exit_code));
       } else {
         error = std::error_code(GetLastError(), std::system_category());
-        status = -1;
+        status = ProcessExitStatus::Unknown(pid_);
       }
 #else
       // There are 3 possible cases:
@@ -482,11 +483,29 @@ int Process::Wait() const {
         while ((r = read(fd_, buf, sizeof(buf))) > 0) {
           // Keep reading until socket terminates
         }
-        status = r == -1 ? -1 : 0;
-      } else if (waitpid(pid_, &status, 0) == -1) {
-        // Just the normal waitpid() case.
-        // (We can only do this once, only if we own the process. It fails otherwise.)
-        error = std::error_code(errno, std::system_category());
+        status = ProcessExitStatus::Unknown(
+            pid_, /*process_exited=*/r != -1, /*legacy_wait_status=*/r == -1 ? -1 : 0);
+      } else {
+        int wait_status = 0;
+        if (waitpid(pid_, &wait_status, 0) == -1) {
+          // Just the normal waitpid() case.
+          // (We can only do this once, only if we own the process. It fails otherwise.)
+          error = std::error_code(errno, std::system_category());
+        } else if (WIFEXITED(wait_status)) {
+          status = ProcessExitStatus::Exited(pid_, WEXITSTATUS(wait_status), wait_status);
+          status.raw_wait_status_known = true;
+          status.raw_wait_status = wait_status;
+        } else if (WIFSIGNALED(wait_status)) {
+          status =
+              ProcessExitStatus::Signaled(pid_, WTERMSIG(wait_status), wait_status);
+          status.raw_wait_status_known = true;
+          status.raw_wait_status = wait_status;
+        } else {
+          status = ProcessExitStatus::Unknown(
+              pid_, /*process_exited=*/true, /*legacy_wait_status=*/wait_status);
+          status.raw_wait_status_known = true;
+          status.raw_wait_status = wait_status;
+        }
       }
 #endif
       if (error) {
@@ -500,6 +519,8 @@ int Process::Wait() const {
   }
   return status;
 }
+
+int Process::Wait() const { return WaitForExit().legacy_wait_status; }
 
 bool Process::IsAlive() const {
   if (IsValid()) {

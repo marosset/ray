@@ -30,6 +30,8 @@
 
 #if !defined(_WIN32)
 #include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 namespace ray {
@@ -129,6 +131,7 @@ TEST(UtilTest, FakeProcessTracksActionOrdering) {
 
   EXPECT_EQ(process.KillCallCount(), 0);
   EXPECT_EQ(process.WaitCallCount(), 0);
+  EXPECT_EQ(process.WaitForExitCallCount(), 0);
   EXPECT_EQ(process.IsAliveCallCount(), 0);
   EXPECT_EQ(process.GracefulTerminationRequestCount(), 0);
   EXPECT_EQ(process.GracefulTerminationUnsupportedCount(), 0);
@@ -138,6 +141,11 @@ TEST(UtilTest, FakeProcessTracksActionOrdering) {
   process.RecordGracefulTerminationRequest("posix-sigterm");
   EXPECT_EQ(process.GracefulTerminationRequestCount(), 1);
   EXPECT_EQ(process.LastGracefulTerminationMechanism(), "posix-sigterm");
+  const auto exit_status = process.WaitForExit();
+  EXPECT_EQ(process.WaitForExitCallCount(), 1);
+  EXPECT_TRUE(exit_status.process_exited);
+  EXPECT_TRUE(exit_status.exit_code_known);
+  EXPECT_EQ(exit_status.exit_code, 17);
   EXPECT_EQ(process.Wait(), 17);
   EXPECT_EQ(process.WaitCallCount(), 1);
   process.RecordGracefulTerminationUnsupported("windows-console-event");
@@ -152,6 +160,7 @@ TEST(UtilTest, FakeProcessTracksActionOrdering) {
   EXPECT_THAT(process.RecordedActions(),
               ::testing::ElementsAre("is_alive",
                                      "graceful",
+                                     "wait_for_exit",
                                      "wait",
                                      "graceful_unsupported",
                                      "kill",
@@ -162,6 +171,7 @@ TEST(UtilTest, FakeProcessTracksActionOrdering) {
   EXPECT_FALSE(process.WasKilled());
   EXPECT_EQ(process.KillCallCount(), 0);
   EXPECT_EQ(process.WaitCallCount(), 0);
+  EXPECT_EQ(process.WaitForExitCallCount(), 0);
   EXPECT_EQ(process.IsAliveCallCount(), 0);
   EXPECT_EQ(process.GracefulTerminationRequestCount(), 0);
   EXPECT_EQ(process.GracefulTerminationUnsupportedCount(), 0);
@@ -171,13 +181,75 @@ TEST(UtilTest, FakeProcessTracksActionOrdering) {
 
 TEST(UtilTest, ProcessBehaviorHelperExitsWithRequestedCode) {
   auto process = SpawnProcessBehaviorHelper({"--exit-code=23"});
-  const int status = process->Wait();
+  const auto status = process->WaitForExit();
+  EXPECT_TRUE(status.process_exited);
 #if defined(_WIN32)
-  EXPECT_EQ(status, 23);
+  EXPECT_TRUE(status.exit_code_known);
+  EXPECT_EQ(status.exit_code, 23);
+  EXPECT_EQ(status.legacy_wait_status, 23);
 #else
   // POSIX Process::Wait currently uses Ray's liveness pipe for spawned processes,
   // so it observes process death but does not preserve the raw exit code yet.
-  EXPECT_EQ(status, 0);
+  EXPECT_FALSE(status.ExitStatusKnown());
+  EXPECT_EQ(status.legacy_wait_status, 0);
+#endif
+}
+
+TEST(UtilTest, ProcessWaitKeepsLegacyStatus) {
+  auto process = SpawnProcessBehaviorHelper({"--exit-code=23"});
+#if defined(_WIN32)
+  EXPECT_EQ(process->Wait(), 23);
+#else
+  EXPECT_EQ(process->Wait(), 0);
+#endif
+}
+
+TEST(UtilTest, ProcessWaitForExitReturnsStructuredStatusForPidWrapper) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "Windows pid wrappers are not waitable without a process handle.";
+#else
+  pid_t pid = fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    _exit(29);
+  }
+
+  Process process(pid);
+  const auto status = process.WaitForExit();
+  EXPECT_EQ(status.pid, pid);
+  EXPECT_TRUE(status.process_exited);
+  EXPECT_TRUE(status.exit_code_known);
+  EXPECT_EQ(status.exit_code, 29);
+  EXPECT_FALSE(status.termination_signal_known);
+  EXPECT_TRUE(status.raw_wait_status_known);
+  EXPECT_TRUE(WIFEXITED(status.raw_wait_status));
+  EXPECT_EQ(WEXITSTATUS(status.raw_wait_status), 29);
+  EXPECT_EQ(status.legacy_wait_status, status.raw_wait_status);
+#endif
+}
+
+TEST(UtilTest, ProcessWaitForExitDecodesPosixSignalStatus) {
+#if defined(_WIN32)
+  GTEST_SKIP() << "POSIX signal status is not available on Windows.";
+#else
+  pid_t pid = fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    raise(SIGTERM);
+    _exit(1);
+  }
+
+  Process process(pid);
+  const auto status = process.WaitForExit();
+  EXPECT_EQ(status.pid, pid);
+  EXPECT_TRUE(status.process_exited);
+  EXPECT_FALSE(status.exit_code_known);
+  EXPECT_TRUE(status.termination_signal_known);
+  EXPECT_EQ(status.termination_signal, SIGTERM);
+  EXPECT_TRUE(status.raw_wait_status_known);
+  EXPECT_TRUE(WIFSIGNALED(status.raw_wait_status));
+  EXPECT_EQ(WTERMSIG(status.raw_wait_status), SIGTERM);
+  EXPECT_EQ(status.legacy_wait_status, status.raw_wait_status);
 #endif
 }
 
