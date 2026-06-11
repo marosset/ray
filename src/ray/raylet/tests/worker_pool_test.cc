@@ -779,6 +779,7 @@ TEST_F(WorkerPoolDriverRegisteredTest,
   auto [proc, worker_id] = worker_pool_->StartWorkerProcess(
       Language::PYTHON, rpc::WorkerType::WORKER, JOB_ID, &status);
   ASSERT_EQ(status, PopWorkerStatus::OK);
+  const auto *started_process = &proc;
 
   EXPECT_EQ(worker_pool_->ClassifyWorkerProcessRegistrationForTest(
                 Language::PYTHON, worker_id, proc.GetId()),
@@ -792,6 +793,10 @@ TEST_F(WorkerPoolDriverRegisteredTest,
   auto worker = worker_pool_->CreateWorker(worker_id, nullptr, Language::PYTHON);
   RAY_CHECK_OK(worker_pool_->RegisterWorker(worker, proc.GetId(), [](Status, int) {}));
   EXPECT_EQ(worker->GetProcess().GetId(), proc.GetId());
+  EXPECT_EQ(&worker->GetProcess(), started_process);
+  EXPECT_EQ(worker_pool_->NumWorkersStarting(), 1);
+  worker_pool_->OnWorkerStarted(worker);
+  EXPECT_EQ(worker_pool_->NumWorkersStarting(), 0);
 }
 
 TEST_F(WorkerPoolDriverRegisteredTest,
@@ -800,6 +805,7 @@ TEST_F(WorkerPoolDriverRegisteredTest,
   auto [proc, worker_id] = worker_pool_->StartWorkerProcess(
       Language::PYTHON, rpc::WorkerType::WORKER, JOB_ID, &status);
   ASSERT_EQ(status, PopWorkerStatus::OK);
+  const auto *started_process = &proc;
   const pid_t registered_pid = proc.GetId() + 1;
 
   EXPECT_EQ(worker_pool_->ClassifyWorkerProcessRegistrationForTest(
@@ -814,6 +820,10 @@ TEST_F(WorkerPoolDriverRegisteredTest,
   auto worker = worker_pool_->CreateWorker(worker_id, nullptr, Language::PYTHON);
   RAY_CHECK_OK(worker_pool_->RegisterWorker(worker, registered_pid, [](Status, int) {}));
   EXPECT_EQ(worker->GetProcess().GetId(), registered_pid);
+  EXPECT_NE(&worker->GetProcess(), started_process);
+  EXPECT_EQ(worker_pool_->NumWorkersStarting(), 1);
+  worker_pool_->OnWorkerStarted(worker);
+  EXPECT_EQ(worker_pool_->NumWorkersStarting(), 0);
 }
 
 TEST_F(WorkerPoolDriverRegisteredTest, HandleUnknownWorkerRegistration) {

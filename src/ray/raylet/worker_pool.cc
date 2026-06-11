@@ -598,15 +598,28 @@ void WorkerPool::MonitorStartingWorkerProcess(const WorkerID &worker_id,
     // to avoid the zombie worker.
     auto it = state.worker_processes.find(worker_id);
     if (it != state.worker_processes.end() && it->second.is_pending_registration) {
-      RAY_LOG(ERROR)
-          << "Some workers of the worker process(" << it->second.proc->GetId()
-          << ") have not registered within the timeout. "
-          << (it->second.proc->IsAlive()
-                  ? "The process is still alive, probably it's hanging during start."
-                  : "The process is dead, probably it crashed during start.");
+      const auto registered_worker = it->second.proc == nullptr
+                                         ? GetWorker(state.registered_workers, worker_id)
+                                         : nullptr;
+      RAY_LOG(ERROR) << "Some workers of the worker process(" << worker_id
+                     << ") have not started within the timeout. "
+                     << (it->second.proc != nullptr
+                             ? (it->second.proc->IsAlive()
+                                    ? "The process is still alive, probably it's hanging "
+                                      "during start."
+                                    : "The process is dead, probably it crashed during start.")
+                         : registered_worker != nullptr
+                             ? (registered_worker->GetProcess().IsAlive()
+                                    ? "The process has registered but has not announced "
+                                      "its port."
+                                    : "The process registered but died before announcing "
+                                      "its port.")
+                             : "The process is no longer tracked by the raylet.");
 
-      if (it->second.proc->IsAlive()) {
+      if (it->second.proc != nullptr && it->second.proc->IsAlive()) {
         it->second.proc->Kill();
+      } else if (registered_worker != nullptr) {
+        registered_worker->KillAsync(*io_service_, /*force=*/true);
       }
 
       process_failed_pending_registration_++;
@@ -863,7 +876,23 @@ Status WorkerPool::RegisterWorker(const std::shared_ptr<WorkerInterface> &worker
         << WorkerProcessRegistrationStatusName(registration_status);
   }
 
-  std::unique_ptr<ProcessInterface> process = std::make_unique<Process>(pid);
+  // The port that this worker's gRPC server should listen on. 0 if the worker
+  // should bind on a random port.
+  int port = 0;
+  Status status = GetNextFreePort(&port);
+  if (!status.ok()) {
+    send_reply_callback(status, /*port=*/0);
+    return status;
+  }
+
+  std::unique_ptr<ProcessInterface> process;
+  if (registration_status == WorkerProcessRegistrationStatus::
+                                 kRayletStartedPidMatchesRegisteredPid) {
+    process = std::move(starting_process_info.proc);
+  } else {
+    process = std::make_unique<Process>(pid);
+  }
+  RAY_CHECK(process != nullptr);
   worker->SetProcess(std::move(process));
 #if !defined(_WIN32)
   // Save the worker's actual PGID at registration for safe cleanup later.
@@ -880,14 +909,6 @@ Status WorkerPool::RegisterWorker(const std::shared_ptr<WorkerInterface> &worker
   }
 #endif
 
-  // The port that this worker's gRPC server should listen on. 0 if the worker
-  // should bind on a random port.
-  int port = 0;
-  Status status = GetNextFreePort(&port);
-  if (!status.ok()) {
-    send_reply_callback(status, /*port=*/0);
-    return status;
-  }
   auto end = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
       end - starting_process_info.start_time);
